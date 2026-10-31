@@ -477,7 +477,8 @@ var DEFAUTS = {
   contactSupport: "",
   passerelleMontantAuto: 500,
   passerelleDelaiSecondes: 120,
-  passerelleSansFrais: 1
+  passerelleSansFrais: 1,
+  passerelleDelaiPaiementMinutes: 10
 };
 var CLES = {
   montantMin: "montant_min",
@@ -489,7 +490,8 @@ var CLES = {
   contactSupport: "contact_support",
   passerelleMontantAuto: "passerelle_montant_auto",
   passerelleDelaiSecondes: "passerelle_delai_secondes",
-  passerelleSansFrais: "passerelle_sans_frais"
+  passerelleSansFrais: "passerelle_sans_frais",
+  passerelleDelaiPaiementMinutes: "passerelle_delai_paiement_minutes"
 };
 var BORNES = {
   montantMin: [1, 1e9],
@@ -500,7 +502,8 @@ var BORNES = {
   connexionVerrouillageMinutes: [1, 1440],
   passerelleMontantAuto: [0, 1e9],
   passerelleDelaiSecondes: [0, 86400],
-  passerelleSansFrais: [0, 1]
+  passerelleSansFrais: [0, 1],
+  passerelleDelaiPaiementMinutes: [3, 120]
 };
 var cache = null;
 var DUREE_CACHE = 30 * 1e3;
@@ -586,7 +589,7 @@ async function enregistrerParametres(acteur, modifsBrutes) {
         [CLES[nom], String(p[nom])]
       );
     }
-    await journaliser(tx, acteur.id, "PARAMETRES", "Frais : " + descriptionGrille(p.grille) + " ; montants de " + nombre(p.montantMin) + " à " + fdj(p.montantMax) + " ; passerelle : " + fdj(p.passerelleMontantAuto) + " sans accord, " + p.passerelleDelaiSecondes + " s entre deux demandes, " + (p.passerelleSansFrais ? "sans frais" : "frais habituels"));
+    await journaliser(tx, acteur.id, "PARAMETRES", "Frais : " + descriptionGrille(p.grille) + " ; montants de " + nombre(p.montantMin) + " à " + fdj(p.montantMax) + " ; passerelle : " + fdj(p.passerelleMontantAuto) + " sans accord, " + p.passerelleDelaiSecondes + " s entre deux demandes, " + (p.passerelleSansFrais ? "sans frais" : "frais habituels") + ", refus sans paiement après " + p.passerelleDelaiPaiementMinutes + " min");
   });
   invaliderParametres();
 }
@@ -1324,7 +1327,8 @@ async function versionPasserelle(t) {
   const defauts = [
     ["passerelle_montant_auto", "500", "Passerelle : montant maximum envoyé sans accord d’un administrateur (FDJ)"],
     ["passerelle_delai_secondes", "120", "Passerelle : accord requis si la demande précédente date de moins de ce délai (secondes)"],
-    ["passerelle_sans_frais", "1", "Passerelle : échanges sans frais entre wallets gérés par la passerelle (test)"]
+    ["passerelle_sans_frais", "1", "Passerelle : échanges sans frais entre wallets gérés par la passerelle (test)"],
+    ["passerelle_delai_paiement_minutes", "10", "Passerelle : demande refusée (paiement non reçu) si aucun paiement n’arrive dans ce délai (minutes)"]
   ];
   for (const [cle, valeur, description] of defauts) {
     await t.exec("INSERT INTO parametres (cle, valeur, description) VALUES (?, ?, ?) ON CONFLICT (cle) DO NOTHING", [cle, valeur, description]);
@@ -1833,7 +1837,8 @@ async function definirSoldeSimule(acteur, args) {
 
 // src/passerelle.ts
 var MINUTE2 = 60 * 1e3;
-var DELAI_VERIFICATION = 15 * MINUTE2;
+var MOTIF_NON_RECU = "Paiement non reçu";
+var FENETRE_PAIEMENT_ANTERIEUR = 24 * 60 * MINUTE2;
 var DELAI_ORDRE = 4 * MINUTE2;
 var DELAI_ORDRE_NON_PRIS = 10 * MINUTE2;
 var TOLERANCE_AVANT_DEMANDE = 2 * MINUTE2;
@@ -2040,8 +2045,9 @@ async function avancerVerification(b, d) {
   const enAttente = ordres.some((o) => o.statut === "A_FAIRE" || o.statut === "EN_COURS");
   const p = await rattacherPaiement(b, d);
   if (!p) {
-    if (t - debut > DELAI_VERIFICATION) {
-      await bloquer2(b, d, "Paiement introuvable : aucun message " + nomOperateur(operateur) + " ne correspond (" + fdj(d.montant) + " du " + formatNumero(d.numero_source) + ") depuis la confirmation du client.");
+    const delai = (await chargerParametres(b)).passerelleDelaiPaiementMinutes;
+    if (t - debut > delai * MINUTE2) {
+      await verificationFinale(b, d, operateur, ordres, enAttente, delai);
       return;
     }
     const recherches = ordres.filter((o) => o.motif === "RECHERCHE");
@@ -2084,6 +2090,68 @@ async function avancerVerification(b, d) {
   }
   await paiementProuve(b, d, p);
 }
+async function verificationFinale(b, d, operateur, ordres, enAttente, delaiMinutes) {
+  const finales = ordres.filter((o) => o.motif === "CONTROLE_FINAL");
+  const f = finales[finales.length - 1];
+  if (!f || f.statut === "ECHEC") {
+    if (enAttente || finales.filter((o) => o.statut === "ECHEC").length >= MAX_ESSAIS_LECTURE) return;
+    await creerOrdre(b, "HISTORIQUE", operateur, d.id, "CONTROLE_FINAL");
+    return;
+  }
+  if (f.statut !== "FAIT") return;
+  const r = lireJson(f.resultat);
+  const quoi = fdj(d.montant) + " du " + formatNumero(d.numero_source);
+  if (operateur === "WAAFI" && !r.releve) {
+    if (Date.now() - (f.date_fin || 0) < DELAI_RELEVE_WAAFI) return;
+    await bloquer2(b, d, "Paiement introuvable (" + quoi + ") et mini-relevé Waafi non reçu lors de la vérification finale : vérifiez sur le téléphone passerelle, puis validez le paiement ou refusez la demande.");
+    return;
+  }
+  const anterieur = await b.ligne(
+    "SELECT * FROM operations_operateur WHERE operateur = ? AND sens = 'RECU' AND demande_id IS NULL AND utilisee = 0 AND montant = ? AND numero = ? AND date_creation > ? ORDER BY id DESC LIMIT 1",
+    [operateur, d.montant, d.numero_source, Date.now() - FENETRE_PAIEMENT_ANTERIEUR]
+  );
+  if (anterieur) {
+    await bloquer2(b, d, "Un paiement " + nomOperateur(operateur) + " de " + quoi + " (ID " + anterieur.operation_id + ") est arrivé avant la demande : vérifiez qu’il correspond bien à cet échange, puis validez le paiement ou refusez la demande.");
+    return;
+  }
+  const autre = await paiementAutreNumero(b, d, operateur);
+  if (autre) {
+    await bloquer2(b, d, "Un paiement " + nomOperateur(operateur) + " de " + fdj(d.montant) + " (ID " + autre.operation_id + ") est arrivé du " + formatNumero(autre.numero) + ", et non du " + formatNumero(d.numero_source) + " indiqué dans la demande : vérifiez auprès du client, puis validez le paiement ou refusez la demande.");
+    return;
+  }
+  if (operateur === "DMONEY") {
+    const inconnue = await b.ligne("SELECT * FROM operations_operateur WHERE operateur = 'DMONEY' AND sens IS NULL AND demande_id IS NULL AND montant = ? AND date_operation >= ? ORDER BY id DESC LIMIT 1", [d.montant, d.date_creation - 30 * MINUTE2]);
+    if (inconnue) {
+      await bloquer2(b, d, "Aucun SMS de paiement, mais une opération de " + fdj(d.montant) + " (ID " + inconnue.operation_id + ") apparaît dans l’historique D-Money : vérifiez sur le téléphone passerelle si elle vient du " + formatNumero(d.numero_source) + ", puis validez le paiement ou refusez la demande.");
+      return;
+    }
+  }
+  await refuserSansPaiement(b, d, operateur, delaiMinutes);
+}
+async function paiementAutreNumero(b, d, operateur) {
+  return b.ligne("SELECT * FROM operations_operateur o WHERE o.operateur = ? AND o.sens = 'RECU' AND o.demande_id IS NULL AND o.utilisee = 0 AND o.montant = ? AND COALESCE(o.date_operation, o.date_creation) >= ? AND NOT EXISTS (SELECT 1 FROM demandes_echange x WHERE x.statut = 'EN_COURS' AND x.etape_passerelle = 'VERIF_PAIEMENT' AND x.id <> ? AND x.montant = o.montant AND x.numero_source = o.numero) ORDER BY o.id DESC LIMIT 1", [operateur, d.montant, d.date_creation - TOLERANCE_AVANT_DEMANDE, d.id]);
+}
+async function refuserSansPaiement(b, d, operateur, delaiMinutes) {
+  const n = await b.exec("UPDATE demandes_echange SET statut = 'REFUSEE', etape_passerelle = NULL, motif_blocage = NULL, motif_refus = ?, date_traitement = ? WHERE id = ? AND statut = 'EN_COURS'", [MOTIF_NON_RECU, Date.now(), d.id]);
+  if (!n) return;
+  await annulerOrdresEnAttente(b, d.id);
+  await notifier(b, d.utilisateur_id, "ECHANGE_REFUSE", "Demande refusée", "Votre demande " + d.reference + " a été refusée. Motif : " + MOTIF_NON_RECU + " (aucun paiement de " + fdj(d.montant) + " reçu du " + formatNumero(d.numero_source) + " sur " + d.source_nom + ").", d.id);
+  await notifierAdmins(b, "PASSERELLE_INFO", "Refus automatique : " + d.reference, d.client_nom + " a confirmé sans paiement : aucun paiement " + nomOperateur(operateur) + " de " + fdj(d.montant) + " du " + formatNumero(d.numero_source) + " en " + delaiMinutes + " minutes, ni dans l’historique de l’opérateur. Demande refusée (paiement non reçu).", d.id);
+  await journaliser(b, null, "REFUS_AUTOMATIQUE", "Demande " + d.reference + " refusée automatiquement : " + MOTIF_NON_RECU + " (" + fdj(d.montant) + " du " + formatNumero(d.numero_source) + ", " + nomOperateur(operateur) + ")");
+}
+async function signalerPaiementTardif(b, op) {
+  if (op.sens !== "RECU" || op.montant == null || !op.numero) return;
+  const w = await walletDe(b, op.operateur);
+  if (!w) return;
+  if (await b.ligne("SELECT id FROM demandes_echange WHERE statut = 'EN_COURS' AND etape_passerelle = 'VERIF_PAIEMENT' AND wallet_source_id = ? AND numero_source = ? AND montant = ? LIMIT 1", [w.id, op.numero, op.montant])) return;
+  const d = await b.ligne(
+    "SELECT id, reference FROM demandes_echange WHERE statut = 'REFUSEE' AND motif_refus = ? AND traite_par IS NULL AND wallet_source_id = ? AND numero_source = ? AND montant = ? AND date_traitement > ? ORDER BY id DESC LIMIT 1",
+    [MOTIF_NON_RECU, w.id, op.numero, op.montant, Date.now() - FENETRE_PAIEMENT_ANTERIEUR]
+  );
+  if (!d) return;
+  await notifierAdmins(b, "PASSERELLE_ALERTE", "Paiement arrivé après un refus : " + d.reference, "Le paiement " + nomOperateur(op.operateur) + " de " + fdj(op.montant) + " du " + formatNumero(op.numero) + " (ID " + op.operation_id + ") est arrivé après le refus automatique de la demande " + d.reference + ". Remboursez le client ou traitez l’échange à la main.", d.id);
+  await journaliser(b, null, "PASSERELLE_PAIEMENT_TARDIF", "Paiement " + nomOperateur(op.operateur) + " ID " + op.operation_id + " arrivé après le refus de " + d.reference);
+}
 async function traiterMessage(passerelleId, m) {
   await transaction(async (b) => {
     const id = await b.valeur(
@@ -2113,7 +2181,11 @@ async function traiterMessage(passerelleId, m) {
     }
     await b.exec("UPDATE messages_passerelle SET operateur = ?, nature = ?, lecture = ? WHERE id = ?", [a2.operateur, a2.nature, a2.resume, id]);
     const source = m.type === "NOTIFICATION" ? "NOTIFICATION" : a2.nature === "RELEVE" ? "RELEVE" : "SMS";
-    for (const o of a2.operations) await enregistrerOperation(b, o, source, false);
+    for (const o of a2.operations) {
+      const connue = await b.ligne("SELECT id FROM operations_operateur WHERE operateur = ? AND operation_id = ?", [o.operateur, o.operationId]);
+      const op = await enregistrerOperation(b, o, source, false);
+      if (!connue && op && a2.nature === "RECEPTION") await signalerPaiementTardif(b, op);
+    }
     if (a2.solde != null && (a2.nature === "RECEPTION" || a2.nature === "ENVOI" || a2.nature === "SOLDE")) await majSolde(b, a2.operateur, a2.solde);
     if (a2.nature === "RELEVE" && a2.operateur === "WAAFI") await rattacherReleveWaafi(b, a2.operations);
     if (a2.nature === "ENVOI") for (const o of a2.operations) await resoudreEnvoiIncertain(b, o);
@@ -2217,8 +2289,13 @@ async function traiterResultat(r) {
           await bloquer2(b, d, "Solde " + nomOperateur(ordre.operateur) + " insuffisant : " + fdj(solde) + " pour un envoi de " + fdj(d.montant_net) + ". Rechargez le compte, puis relancez l’envoi.");
           return;
         }
+        const numero = (d.numero_dest || "").replace(/\D/g, "");
+        if (!/^\d{8}$/.test(numero)) {
+          await bloquer2(b, d, "Numéro destinataire invalide pour un envoi USSD (" + d.numero_dest + ") : 8 chiffres attendus.");
+          return;
+        }
         const n = (await ordresDe(b, d.id)).filter((o) => o.type === "ENVOI").length + 1;
-        await creerOrdre(b, "ENVOI", ordre.operateur, d.id, "ENVOI", { montant: d.montant_net, numero: d.numero_dest, cle: "ENVOI-" + d.id + "-" + n });
+        await creerOrdre(b, "ENVOI", ordre.operateur, d.id, "ENVOI", { montant: d.montant_net, numero, cle: "ENVOI-" + d.id + "-" + n });
       }
       return;
     }
@@ -2536,8 +2613,14 @@ async function validerPaiement(acteur, args) {
     if (d.paiement_verifie) throw new Erreur("Le paiement est déjà vérifié.");
     if (d.etape_passerelle !== "VERIF_PAIEMENT" && d.etape_passerelle !== "BLOQUEE") throw new Erreur("Action impossible à cette étape.");
     await annulerOrdresEnAttente(b, d.id);
-    await b.exec("UPDATE demandes_echange SET paiement_verifie = 2 WHERE id = ?", [d.id]);
-    await journaliser(b, acteur.id, "PASSERELLE_PAIEMENT_MANUEL", "Paiement de la demande " + d.reference + " vérifié à la main (" + fdj(d.montant) + ")");
+    const op = await paiementLibre(b, d);
+    if (op) {
+      await b.exec("UPDATE operations_operateur SET demande_id = ?, role = 'PAIEMENT', utilisee = 1, sens = COALESCE(sens, 'RECU'), numero = COALESCE(numero, ?) WHERE id = ? AND demande_id IS NULL", [d.id, d.numero_source, op.id]);
+      await b.exec("UPDATE demandes_echange SET paiement_verifie = 2, ref_api_source = ? WHERE id = ?", [op.operation_id, d.id]);
+    } else {
+      await b.exec("UPDATE demandes_echange SET paiement_verifie = 2 WHERE id = ?", [d.id]);
+    }
+    await journaliser(b, acteur.id, "PASSERELLE_PAIEMENT_MANUEL", "Paiement de la demande " + d.reference + " vérifié à la main (" + fdj(d.montant) + ")" + (op ? ", ID " + op.operation_id : ""));
     if (d.dest_passerelle && d.dest_mode === "AUTOMATIQUE") {
       await lancerEnvoi(b, d);
     } else {
@@ -2545,6 +2628,19 @@ async function validerPaiement(acteur, args) {
     }
   });
   declencher();
+}
+async function paiementLibre(b, d) {
+  if (!d.source_passerelle) return null;
+  const recu = await b.ligne(
+    "SELECT * FROM operations_operateur WHERE operateur = ? AND sens = 'RECU' AND demande_id IS NULL AND utilisee = 0 AND montant = ? AND numero = ? AND date_creation > ? ORDER BY id DESC LIMIT 1 FOR UPDATE",
+    [d.source_passerelle, d.montant, d.numero_source, Date.now() - FENETRE_PAIEMENT_ANTERIEUR]
+  );
+  if (recu) return recu;
+  if (d.source_passerelle === "DMONEY") {
+    const ligne = await b.ligne("SELECT * FROM operations_operateur WHERE operateur = 'DMONEY' AND sens IS NULL AND demande_id IS NULL AND utilisee = 0 AND montant = ? AND date_operation >= ? ORDER BY id DESC LIMIT 1 FOR UPDATE", [d.montant, d.date_creation - 30 * MINUTE2]);
+    if (ligne) return ligne;
+  }
+  return paiementAutreNumero(b, d, d.source_passerelle);
 }
 async function preparerDecisionManuelle(b, demandeId) {
   if (await envoiEnCours(b, demandeId)) {
