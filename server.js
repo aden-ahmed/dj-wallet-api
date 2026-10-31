@@ -1,4 +1,4 @@
-// Dj Wallet Exchange — serveur API 1.2.0 (fichier construit par serveur/build.mjs à partir de serveur/src :
+// Dj Wallet Exchange — serveur API 1.3.0 (fichier construit par serveur/build.mjs à partir de serveur/src :
 // ne pas modifier à la main). Déposer ce fichier et package.json sur GitHub ; Render installe « pg » et lance « node server.js ».
 "use strict";
 var __create = Object.create;
@@ -143,6 +143,16 @@ function calculerFrais(montant, dest, grille) {
   const libelle = t.type === "FIXE" ? "Frais fixes (" + libelleIntervalle(debutTranche(grille, i), t.max) + ")" : "Frais (" + formatPourcentage(t.valeur) + " %)";
   return { frais, fraisSysteme: frais, commission: 0, tauxCommission: null, net: montant - frais, libelle, sansFrais: false };
 }
+var LIBELLE_SANS_FRAIS_TEST = "Sans frais (test de la passerelle)";
+function calculerFraisEchange(montant, source, dest, grille, sansFraisPasserelle) {
+  if (sansFraisPasserelle && source.passerelle && dest.passerelle) {
+    return { frais: 0, fraisSysteme: 0, commission: 0, tauxCommission: null, net: montant, libelle: LIBELLE_SANS_FRAIS_TEST, sansFrais: true };
+  }
+  return calculerFrais(montant, dest, grille);
+}
+function nomOperateur(o) {
+  return o === "DMONEY" ? "D-Money" : "Waafi";
+}
 var NBSP = " ";
 function nombre(n) {
   const neg = n < 0;
@@ -193,8 +203,8 @@ var Erreur = class extends Error {
 var import_pg = require("pg");
 
 // src/config.ts
-var VERSION = "1.2.0";
-var VERSION_SCHEMA = 3;
+var VERSION = "1.3.0";
+var VERSION_SCHEMA = 4;
 function drapeau(nom, defaut) {
   const v = (process.env[nom] || "").trim().toLowerCase();
   if (!v) return defaut;
@@ -464,7 +474,10 @@ var DEFAUTS = {
   codeRenvoiSecondes: 90,
   connexionMaxTentatives: 5,
   connexionVerrouillageMinutes: 5,
-  contactSupport: ""
+  contactSupport: "",
+  passerelleMontantAuto: 500,
+  passerelleDelaiSecondes: 120,
+  passerelleSansFrais: 1
 };
 var CLES = {
   montantMin: "montant_min",
@@ -473,7 +486,10 @@ var CLES = {
   codeRenvoiSecondes: "code_renvoi_secondes",
   connexionMaxTentatives: "connexion_max_tentatives",
   connexionVerrouillageMinutes: "connexion_verrouillage_minutes",
-  contactSupport: "contact_support"
+  contactSupport: "contact_support",
+  passerelleMontantAuto: "passerelle_montant_auto",
+  passerelleDelaiSecondes: "passerelle_delai_secondes",
+  passerelleSansFrais: "passerelle_sans_frais"
 };
 var BORNES = {
   montantMin: [1, 1e9],
@@ -481,7 +497,10 @@ var BORNES = {
   codeValiditeMinutes: [2, 60],
   codeRenvoiSecondes: [30, 3600],
   connexionMaxTentatives: [3, 20],
-  connexionVerrouillageMinutes: [1, 1440]
+  connexionVerrouillageMinutes: [1, 1440],
+  passerelleMontantAuto: [0, 1e9],
+  passerelleDelaiSecondes: [0, 86400],
+  passerelleSansFrais: [0, 1]
 };
 var cache = null;
 var DUREE_CACHE = 30 * 1e3;
@@ -567,7 +586,7 @@ async function enregistrerParametres(acteur, modifsBrutes) {
         [CLES[nom], String(p[nom])]
       );
     }
-    await journaliser(tx, acteur.id, "PARAMETRES", "Frais : " + descriptionGrille(p.grille) + " ; montants de " + nombre(p.montantMin) + " à " + fdj(p.montantMax));
+    await journaliser(tx, acteur.id, "PARAMETRES", "Frais : " + descriptionGrille(p.grille) + " ; montants de " + nombre(p.montantMin) + " à " + fdj(p.montantMax) + " ; passerelle : " + fdj(p.passerelleMontantAuto) + " sans accord, " + p.passerelleDelaiSecondes + " s entre deux demandes, " + (p.passerelleSansFrais ? "sans frais" : "frais habituels"));
   });
   invaliderParametres();
 }
@@ -1278,6 +1297,39 @@ async function securiserComptes(t, actions) {
     actions.push("Compte bloqué (mot de passe de test) : " + c.email);
   }
 }
+async function versionPasserelle(t) {
+  await t.exec("ALTER TABLE wallets ADD COLUMN IF NOT EXISTS passerelle TEXT");
+  await t.exec("ALTER TABLE wallets ADD COLUMN IF NOT EXISTS solde_maj BIGINT");
+  await t.exec("ALTER TABLE wallets DROP CONSTRAINT IF EXISTS wallets_passerelle_check");
+  await t.exec("ALTER TABLE wallets ADD CONSTRAINT wallets_passerelle_check CHECK (passerelle IS NULL OR passerelle IN ('DMONEY', 'WAAFI'))");
+  await t.exec("CREATE UNIQUE INDEX IF NOT EXISTS ux_wallets_passerelle ON wallets (passerelle) WHERE passerelle IS NOT NULL");
+  await t.exec("ALTER TABLE demandes_echange ADD COLUMN IF NOT EXISTS etape_passerelle TEXT");
+  await t.exec("ALTER TABLE demandes_echange ADD COLUMN IF NOT EXISTS motif_blocage TEXT");
+  await t.exec("ALTER TABLE demandes_echange ADD COLUMN IF NOT EXISTS date_blocage BIGINT");
+  await t.exec("ALTER TABLE demandes_echange DROP CONSTRAINT IF EXISTS demandes_echange_etape_check");
+  await t.exec("ALTER TABLE demandes_echange ADD CONSTRAINT demandes_echange_etape_check CHECK (etape_passerelle IS NULL OR etape_passerelle IN ('VERIF_PAIEMENT', 'ATTENTE_ACCORD', 'ENVOI', 'BLOQUEE'))");
+  await t.exec("CREATE INDEX IF NOT EXISTS idx_demandes_etape ON demandes_echange (etape_passerelle) WHERE etape_passerelle IS NOT NULL");
+  await t.exec("CREATE TABLE IF NOT EXISTS passerelles (id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, nom TEXT NOT NULL, jeton_hash TEXT UNIQUE, code_hash TEXT, code_expire BIGINT, actif BIGINT NOT NULL DEFAULT 0, etat TEXT, date_creation BIGINT NOT NULL, date_association BIGINT, dernier_contact BIGINT)");
+  await t.exec("CREATE TABLE IF NOT EXISTS messages_passerelle (id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, passerelle_id BIGINT NOT NULL REFERENCES passerelles (id) ON DELETE CASCADE, id_local TEXT NOT NULL, type TEXT NOT NULL CHECK (type IN ('SMS', 'NOTIFICATION')), expediteur TEXT NOT NULL, texte TEXT NOT NULL, recu_a BIGINT NOT NULL, date_reception BIGINT NOT NULL, operateur TEXT, nature TEXT, lecture TEXT, UNIQUE (passerelle_id, id_local))");
+  await t.exec("CREATE TABLE IF NOT EXISTS operations_operateur (id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, operateur TEXT NOT NULL CHECK (operateur IN ('DMONEY', 'WAAFI')), operation_id TEXT NOT NULL, sens TEXT CHECK (sens IS NULL OR sens IN ('RECU', 'ENVOYE')), montant BIGINT, numero TEXT, nom TEXT, date_operation BIGINT, solde_apres BIGINT, source TEXT NOT NULL, confirme_operateur BIGINT, demande_id BIGINT REFERENCES demandes_echange (id) ON DELETE SET NULL, role TEXT CHECK (role IS NULL OR role IN ('PAIEMENT', 'VERSEMENT')), utilisee BIGINT NOT NULL DEFAULT 0, date_creation BIGINT NOT NULL, UNIQUE (operateur, operation_id))");
+  await t.exec("CREATE TABLE IF NOT EXISTS ordres_passerelle (id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, type TEXT NOT NULL CHECK (type IN ('SOLDE', 'HISTORIQUE', 'ENVOI')), operateur TEXT NOT NULL CHECK (operateur IN ('DMONEY', 'WAAFI')), demande_id BIGINT REFERENCES demandes_echange (id) ON DELETE SET NULL, motif TEXT, montant BIGINT, numero TEXT, statut TEXT NOT NULL DEFAULT 'A_FAIRE' CHECK (statut IN ('A_FAIRE', 'EN_COURS', 'FAIT', 'ECHEC', 'INCERTAIN', 'ANNULE')), tentatives BIGINT NOT NULL DEFAULT 0, resultat TEXT, erreur TEXT, cle TEXT UNIQUE, date_creation BIGINT NOT NULL, date_prise BIGINT, date_fin BIGINT)");
+  await t.exec("CREATE INDEX IF NOT EXISTS idx_messages_passerelle_date ON messages_passerelle (date_reception)");
+  await t.exec("CREATE INDEX IF NOT EXISTS idx_operations_demande ON operations_operateur (demande_id)");
+  await t.exec("CREATE INDEX IF NOT EXISTS idx_operations_attente ON operations_operateur (operateur, sens, utilisee)");
+  await t.exec("CREATE INDEX IF NOT EXISTS idx_ordres_statut ON ordres_passerelle (statut, id)");
+  await t.exec("CREATE INDEX IF NOT EXISTS idx_ordres_demande ON ordres_passerelle (demande_id)");
+  for (const table of ["passerelles", "messages_passerelle", "operations_operateur", "ordres_passerelle"]) {
+    await t.exec("ALTER TABLE " + table + " ENABLE ROW LEVEL SECURITY");
+  }
+  const defauts = [
+    ["passerelle_montant_auto", "500", "Passerelle : montant maximum envoyé sans accord d’un administrateur (FDJ)"],
+    ["passerelle_delai_secondes", "120", "Passerelle : accord requis si la demande précédente date de moins de ce délai (secondes)"],
+    ["passerelle_sans_frais", "1", "Passerelle : échanges sans frais entre wallets gérés par la passerelle (test)"]
+  ];
+  for (const [cle, valeur, description] of defauts) {
+    await t.exec("INSERT INTO parametres (cle, valeur, description) VALUES (?, ?, ?) ON CONFLICT (cle) DO NOTHING", [cle, valeur, description]);
+  }
+}
 async function migrer() {
   return transaction(async (t) => {
     await t.exec("SELECT pg_advisory_xact_lock(7230142)");
@@ -1290,14 +1342,20 @@ async function migrer() {
     const version = Number(await t.valeur("SELECT valeur FROM meta_schema WHERE cle = 'version'")) || 2;
     if (version >= VERSION_SCHEMA) return { version, actions: [] };
     const actions = [];
-    await t.exec("ALTER TABLE utilisateurs ADD COLUMN IF NOT EXISTS doit_changer_mdp BIGINT NOT NULL DEFAULT 0");
-    await creerIndexUnique(t, "ux_utilisateurs_email_min", "utilisateurs", "lower(email)", actions);
-    await creerIndexUnique(t, "ux_wallets_nom_min", "wallets", "lower(nom)", actions);
-    await creerIndexUnique(t, "ux_wallets_code_min", "wallets", "lower(code)", actions);
-    await t.exec("CREATE INDEX IF NOT EXISTS idx_demandes_statut_traitement ON demandes_echange (statut, date_traitement)");
-    await t.exec("CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications (utilisateur_id, id)");
-    await t.exec("CREATE INDEX IF NOT EXISTS idx_sessions_expiration ON sessions (date_expiration)");
-    if (!config.garderComptesTest) await securiserComptes(t, actions);
+    if (version < 3) {
+      await t.exec("ALTER TABLE utilisateurs ADD COLUMN IF NOT EXISTS doit_changer_mdp BIGINT NOT NULL DEFAULT 0");
+      await creerIndexUnique(t, "ux_utilisateurs_email_min", "utilisateurs", "lower(email)", actions);
+      await creerIndexUnique(t, "ux_wallets_nom_min", "wallets", "lower(nom)", actions);
+      await creerIndexUnique(t, "ux_wallets_code_min", "wallets", "lower(code)", actions);
+      await t.exec("CREATE INDEX IF NOT EXISTS idx_demandes_statut_traitement ON demandes_echange (statut, date_traitement)");
+      await t.exec("CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications (utilisateur_id, id)");
+      await t.exec("CREATE INDEX IF NOT EXISTS idx_sessions_expiration ON sessions (date_expiration)");
+      if (!config.garderComptesTest) await securiserComptes(t, actions);
+    }
+    if (version < 4) {
+      await versionPasserelle(t);
+      actions.push("Passerelle téléphone : tables et réglages du test créés");
+    }
     await t.exec(
       "INSERT INTO meta_schema (cle, valeur) VALUES ('version', ?) ON CONFLICT (cle) DO UPDATE SET valeur = EXCLUDED.valeur",
       [String(VERSION_SCHEMA)]
@@ -1305,6 +1363,205 @@ async function migrer() {
     await journaliser(t, null, "MISE_A_JOUR", "Base en ligne mise à jour pour la version " + VERSION + (actions.length ? " : " + actions.join(" ; ") : ""));
     return { version: VERSION_SCHEMA, actions };
   });
+}
+
+// src/lecteurs.ts
+var DECALAGE_DJIBOUTI_MS = 3 * 3600 * 1e3;
+function normaliserTexte(t) {
+  return (t || "").normalize("NFC").replace(/[‘’ʼ`´]/g, "'").replace(/[\u00a0\u202f\u2007]/g, " ").replace(/\r\n?/g, "\n").replace(/[ \t]+/g, " ").trim();
+}
+function montantDe(brut) {
+  if (brut == null) return null;
+  let s2 = String(brut).replace(/[\s\u00a0]/g, "");
+  if (!s2) return null;
+  if (/^\d{1,3}([,.]\d{3})+$/.test(s2)) {
+    s2 = s2.replace(/[,.]/g, "");
+  } else if (/^\d+[.,]\d{1,2}$/.test(s2)) {
+    return Math.round(Number(s2.replace(",", ".")));
+  } else if (!/^\d+$/.test(s2)) {
+    return null;
+  }
+  const n = Number(s2);
+  return isFinite(n) ? n : null;
+}
+function dateDj(jour, mois, annee, h, mi, s2) {
+  if (annee < 100) annee += 2e3;
+  if (!(mois >= 1 && mois <= 12 && jour >= 1 && jour <= 31 && h <= 23 && mi <= 59 && s2 <= 59)) return null;
+  return Date.UTC(annee, mois - 1, jour, h, mi, s2) - DECALAGE_DJIBOUTI_MS;
+}
+function numeroDe(brut) {
+  return brut ? normaliserNumero(brut) : null;
+}
+function nomDe(brut) {
+  const n = (brut || "").replace(/\s+/g, " ").trim();
+  return n ? n.substring(0, 80) : null;
+}
+var N = "(\\d[\\d,. ]*?)";
+var DATE_LONGUE = "(\\d{2})\\/(\\d{2})\\/(\\d{4})\\s+(\\d{2}):(\\d{2}):(\\d{2})";
+var DATE_COURTE = "(\\d{2})\\/(\\d{2})\\/(\\d{2})\\s+(\\d{2}):(\\d{2}):(\\d{2})";
+var DM_RECU = new RegExp("Vous avez re[çc]u avec succ[èe]s\\s+" + N + "\\s*DJF\\s+de l'abonn[ée]\\s+(\\d{8,13})\\s+sur votre Compte principale?\\s+le\\s+" + DATE_LONGUE + "\\.?\\s*Le nouveau solde de votre Compte principale?\\s+est de\\s+" + N + "\\s*DJF\\.?\\s*L'identifiant de l'op[ée]ration est\\s+(\\d{6,20})", "i");
+var DM_ENVOYE = new RegExp("Vous avez effectu[ée] un transfert de\\s+" + N + "\\s*DJF\\s+vers l'abonn[ée]\\s+(\\d{8,13})\\s+[àa] partir de votre Compte principale?\\s+le\\s+" + DATE_LONGUE + "\\.?\\s*Le nouveau solde de votre Compte principale?\\s+est de\\s+" + N + "\\s*DJF\\.?\\s*L'identifiant de l'op[ée]ration est\\s+(\\d{6,20})", "i");
+var DM_RELEVE = new RegExp("Op[ée]ration ID\\s*:\\s*(\\d{6,20})\\s*,\\s*Date\\s*:\\s*" + DATE_LONGUE + "\\s*,\\s*D[ée]tails\\s*:\\s*([^,]*?)\\s*,\\s*Montant\\s*:\\s*" + N + "\\s*DJF\\s*,\\s*Frais\\s*:\\s*" + N + "\\s*DJF\\s*,\\s*Statut\\s*:\\s*([A-Za-z]+)", "gi");
+var DM_ECRAN_LIGNE = /(\d{9,20})\s*,\s*(\d[\d,.]*)\s*DJF\s*,\s*(\d{4})(\d{2})(\d{2})\s+(\d{2}):(\d{2})/gi;
+var DM_ECRAN_SOLDE = new RegExp("solde de votre compte principale?\\s+est de\\s*:?\\s*" + N + "\\s*DJF", "i");
+var DM_ECRAN_ENVOI = new RegExp("Transfert r[ée]ussi.*?ID de transaction\\s*:\\s*(\\d{6,20}).*?Montant\\s*:\\s*" + N + "\\s*DJF.*?Frais\\s*:\\s*" + N + "\\s*DJF.*?Nouveau solde\\s*:\\s*" + N + "\\s*DJF", "is");
+function dmRecu(t) {
+  const m = DM_RECU.exec(t);
+  if (!m) return null;
+  return {
+    operateur: "DMONEY",
+    operationId: m[10],
+    sens: "RECU",
+    montant: montantDe(m[1]),
+    numero: numeroDe(m[2]),
+    nom: null,
+    date: dateDj(+m[3], +m[4], +m[5], +m[6], +m[7], +m[8]),
+    soldeApres: montantDe(m[9])
+  };
+}
+function dmEnvoye(t) {
+  const m = DM_ENVOYE.exec(t);
+  if (!m) return null;
+  return {
+    operateur: "DMONEY",
+    operationId: m[10],
+    sens: "ENVOYE",
+    montant: montantDe(m[1]),
+    numero: numeroDe(m[2]),
+    nom: null,
+    date: dateDj(+m[3], +m[4], +m[5], +m[6], +m[7], +m[8]),
+    soldeApres: montantDe(m[9])
+  };
+}
+function lireReleveDmoney(texte2) {
+  const t = normaliserTexte(texte2);
+  if (!/historique des transactions/i.test(t)) return [];
+  const res = [];
+  DM_RELEVE.lastIndex = 0;
+  let m;
+  while ((m = DM_RELEVE.exec(t)) !== null) {
+    if (!/^completed$/i.test(m[11])) continue;
+    res.push({
+      operateur: "DMONEY",
+      operationId: m[1],
+      sens: null,
+      montant: montantDe(m[9]),
+      numero: null,
+      nom: null,
+      date: dateDj(+m[2], +m[3], +m[4], +m[5], +m[6], +m[7]),
+      soldeApres: null
+    });
+  }
+  return res;
+}
+function lireEcranHistoriqueDmoney(texte2) {
+  const t = normaliserTexte(texte2);
+  if (!/Op[ée]ration\s*ID/i.test(t)) return [];
+  const res = [];
+  DM_ECRAN_LIGNE.lastIndex = 0;
+  let m;
+  while ((m = DM_ECRAN_LIGNE.exec(t)) !== null) {
+    res.push({ operationId: m[1], montant: montantDe(m[2]), date: dateDj(+m[5], +m[4], +m[3], +m[6], +m[7], 0) });
+  }
+  return res;
+}
+var WF_RECU = new RegExp("Transfer-Id\\s*:\\s*(\\d{5,20})\\s*,\\s*You have Received DJF\\s*" + N + "\\s+from\\s+(.+?)\\s*\\((\\d{8,13})\\)\\s*,?\\s*(?:at\\s+" + DATE_COURTE + "\\s*,?\\s*)?Your Balance is\\s*:?\\s*DJF\\s*" + N + "(?:\\.|\\s|$)", "i");
+var WF_ENVOYE = new RegExp("Transfer-Id\\s*:\\s*(\\d{5,20})\\s*,\\s*You have successfully transferred DJF\\s*" + N + "\\s+to\\s+(.+?)\\s*\\((\\d{8,13})\\)\\s*(?:at\\s+" + DATE_COURTE + "\\s*)?,?\\s*Your Balance is\\s*:?\\s*DJF\\s*" + N + "(?:\\.|\\s|$)", "i");
+var WF_RELEVE = new RegExp("(\\d{1,2})\\.\\s*TranId\\s*:\\s*(\\d{5,20})\\s*Details\\s*:\\s*(Sent|Received)\\s+DJF\\s*" + N + "\\s+(?:to|from)\\s+(.+?)\\s*\\((\\d{8,13})\\)\\s*at\\s+" + DATE_COURTE, "gi");
+var WF_ECRAN_SOLDE = new RegExp("Your current balance is\\s*:?\\s*DJF\\s*" + N + "(?:\\.|\\s|$)", "i");
+function wfRecu(t) {
+  const m = WF_RECU.exec(t);
+  if (!m) return null;
+  return {
+    operateur: "WAAFI",
+    operationId: m[1],
+    sens: "RECU",
+    montant: montantDe(m[2]),
+    numero: numeroDe(m[4]),
+    nom: nomDe(m[3]),
+    date: m[5] ? dateDj(+m[5], +m[6], +m[7], +m[8], +m[9], +m[10]) : null,
+    soldeApres: montantDe(m[11])
+  };
+}
+function wfEnvoye(t) {
+  const m = WF_ENVOYE.exec(t);
+  if (!m) return null;
+  return {
+    operateur: "WAAFI",
+    operationId: m[1],
+    sens: "ENVOYE",
+    montant: montantDe(m[2]),
+    numero: numeroDe(m[4]),
+    nom: nomDe(m[3]),
+    date: m[5] ? dateDj(+m[5], +m[6], +m[7], +m[8], +m[9], +m[10]) : null,
+    soldeApres: montantDe(m[11])
+  };
+}
+function lireReleveWaafi(texte2) {
+  const t = normaliserTexte(texte2);
+  if (!/Mini Statement/i.test(t)) return [];
+  const res = [];
+  WF_RELEVE.lastIndex = 0;
+  let m;
+  while ((m = WF_RELEVE.exec(t)) !== null) {
+    res.push({
+      operateur: "WAAFI",
+      operationId: m[2],
+      sens: /^received$/i.test(m[3]) ? "RECU" : "ENVOYE",
+      montant: montantDe(m[4]),
+      numero: numeroDe(m[6]),
+      nom: nomDe(m[5]),
+      date: dateDj(+m[7], +m[8], +m[9], +m[10], +m[11], +m[12]),
+      soldeApres: null
+    });
+  }
+  return res;
+}
+function lireEcranSolde(operateur, texte2) {
+  const t = normaliserTexte(texte2);
+  const m = (operateur === "DMONEY" ? DM_ECRAN_SOLDE : WF_ECRAN_SOLDE).exec(t);
+  return m ? montantDe(m[1]) : null;
+}
+function lireEcranEnvoi(operateur, texte2) {
+  const t = normaliserTexte(texte2);
+  if (operateur === "WAAFI") return wfEnvoye(t);
+  const m = DM_ECRAN_ENVOI.exec(t);
+  if (!m) return null;
+  return { operateur: "DMONEY", operationId: m[1], sens: "ENVOYE", montant: montantDe(m[2]), numero: null, nom: null, date: null, soldeApres: montantDe(m[4]) };
+}
+function releveWaafiEnvoye(texte2) {
+  return /mini statement has been sent/i.test(normaliserTexte(texte2));
+}
+function resumeOperation(o) {
+  const sens = o.sens === "RECU" ? "reçu" : o.sens === "ENVOYE" ? "envoyé" : "opération";
+  return (o.operateur === "DMONEY" ? "D-Money" : "Waafi") + " " + sens + " " + (o.montant != null ? o.montant + " FDJ" : "?") + (o.numero ? (o.sens === "RECU" ? " de " : " vers ") + o.numero : "") + ", ID " + o.operationId;
+}
+function analyserMessage(texte2) {
+  const t = normaliserTexte(texte2);
+  const vide = { operateur: null, nature: null, operations: [], solde: null, resume: "Message sans rapport avec D-Money ou Waafi" };
+  if (!t) return vide;
+  const dm = dmRecu(t) || dmEnvoye(t);
+  if (dm) return { operateur: "DMONEY", nature: dm.sens === "RECU" ? "RECEPTION" : "ENVOI", operations: [dm], solde: dm.soldeApres, resume: resumeOperation(dm) };
+  const releveDm = lireReleveDmoney(t);
+  if (releveDm.length) {
+    return { operateur: "DMONEY", nature: "RELEVE", operations: releveDm, solde: null, resume: "Historique D-Money : " + releveDm.map((o) => o.operationId).join(", ") };
+  }
+  const wf = wfRecu(t) || wfEnvoye(t);
+  if (wf) return { operateur: "WAAFI", nature: wf.sens === "RECU" ? "RECEPTION" : "ENVOI", operations: [wf], solde: wf.soldeApres, resume: resumeOperation(wf) };
+  const releveWf = lireReleveWaafi(t);
+  if (releveWf.length) {
+    return { operateur: "WAAFI", nature: "RELEVE", operations: releveWf, solde: null, resume: "Mini-relevé Waafi : " + releveWf.map((o) => o.operationId).join(", ") };
+  }
+  const soldeWf = lireEcranSolde("WAAFI", t);
+  if (soldeWf != null) return { operateur: "WAAFI", nature: "SOLDE", operations: [], solde: soldeWf, resume: "Solde Waafi : " + soldeWf + " FDJ" };
+  if (/WAAFI/i.test(t)) return { operateur: "WAAFI", nature: "AUTRE", operations: [], solde: null, resume: "Message Waafi non reconnu" };
+  if (/D-?MONEY|identifiant de l'op[ée]ration|Compte principal/i.test(t)) {
+    return { operateur: "DMONEY", nature: "AUTRE", operations: [], solde: null, resume: "Message D-Money non reconnu" };
+  }
+  return vide;
+}
+function normaliserExpediteur(e) {
+  return (e || "").toUpperCase().replace(/[^A-Z0-9.]/g, "");
 }
 
 // src/walletApi.ts
@@ -1326,7 +1583,7 @@ async function lireSolde(w) {
 }
 
 // src/wallets.ts
-var COLONNES = "id, nom, code, operateur, description, logo, logo_mime, couleur, type_compte, compte_reception, nom_compte, statut, mode_echange, regle_frais, frais_pourcentage, frais_compte_revenu, solde_api, seuil_alerte, api_url, (CASE WHEN api_cle IS NOT NULL AND api_cle <> '' THEN 1 ELSE 0 END) AS a_cle_api, ordre, date_creation, date_maj";
+var COLONNES = "id, nom, code, operateur, description, logo, logo_mime, couleur, type_compte, compte_reception, nom_compte, statut, mode_echange, regle_frais, frais_pourcentage, frais_compte_revenu, solde_api, seuil_alerte, api_url, (CASE WHEN api_cle IS NOT NULL AND api_cle <> '' THEN 1 ELSE 0 END) AS a_cle_api, ordre, date_creation, date_maj, passerelle, solde_maj";
 function versWallet(l) {
   l.logo = l.logo ? Buffer.from(l.logo).toString("base64") : null;
   return l;
@@ -1345,7 +1602,7 @@ async function listerWallets(acteur) {
   const wallets = await tousLesWallets();
   if (estAdmin(acteur)) return wallets;
   return wallets.map((w) => {
-    const v = Object.assign({}, w, { solde_api: 0, seuil_alerte: 0, api_url: null, a_cle_api: 0 });
+    const v = Object.assign({}, w, { solde_api: 0, seuil_alerte: 0, api_url: null, a_cle_api: 0, solde_maj: null });
     if (!acteur) {
       v.compte_reception = null;
       v.nom_compte = null;
@@ -1531,12 +1788,17 @@ async function definirModes(acteur, args) {
     if (resume.length) await journaliser(tx, acteur.id, "MODE_ECHANGE", "Mode d’échange : " + resume.join(", "));
   });
 }
-async function actualiserSoldes(acteur) {
+async function actualiserSoldes2(acteur) {
   exigerRole(acteur, ["ADMIN", "SUPER_ADMIN"]);
   const wallets = await tousLesWallets();
   let interroges = 0;
+  const parPasserelle = wallets.filter((w) => w.statut === "ACTIF" && w.passerelle).map((w) => w.passerelle);
+  if (parPasserelle.length) {
+    await transaction((tx) => soldesPasserelle(tx, parPasserelle));
+    interroges += parPasserelle.length;
+  }
   for (const w of wallets) {
-    if (w.statut !== "ACTIF" || w.mode_echange !== "AUTOMATIQUE") continue;
+    if (w.statut !== "ACTIF" || w.mode_echange !== "AUTOMATIQUE" || w.passerelle) continue;
     interroges++;
     const pourApi = await walletPourApi(base(), w.id);
     if (!pourApi) continue;
@@ -1552,6 +1814,9 @@ async function actualiserSoldes(acteur) {
   }
   return interroges;
 }
+async function soldesPasserelle(tx, operateurs) {
+  await actualiserSoldes(tx, operateurs);
+}
 async function definirSoldeSimule(acteur, args) {
   exigerRole(acteur, ["SUPER_ADMIN"]);
   if (!config.modeTest) throw new Erreur("Le solde simulé n’est disponible qu’en mode test.");
@@ -1566,9 +1831,821 @@ async function definirSoldeSimule(acteur, args) {
   });
 }
 
+// src/passerelle.ts
+var MINUTE2 = 60 * 1e3;
+var DELAI_VERIFICATION = 15 * MINUTE2;
+var DELAI_ORDRE = 4 * MINUTE2;
+var DELAI_ORDRE_NON_PRIS = 10 * MINUTE2;
+var TOLERANCE_AVANT_DEMANDE = 2 * MINUTE2;
+var DELAI_RECHERCHE_WAAFI = 2 * MINUTE2;
+var MAX_HISTORIQUES = 3;
+var ECART_HISTORIQUES = 30 * 1e3;
+var MAX_ESSAIS_LECTURE = 3;
+var DELAI_RESOLUTION_ENVOI = 20 * MINUTE2;
+var DELAI_RELEVE_WAAFI = 3 * MINUTE2;
+var ALPHABET_CODE = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+var SELECTION_P = "SELECT d.id, d.reference, d.utilisateur_id, d.wallet_source_id, d.wallet_dest_id, d.numero_source, d.numero_dest, d.montant, d.montant_net, d.statut, d.etape_passerelle, d.paiement_verifie, d.ref_api_source, d.date_creation, d.date_confirmation, d.taux_commission, d.mode_dest, ws.nom AS source_nom, wd.nom AS dest_nom, ws.passerelle AS source_passerelle, wd.passerelle AS dest_passerelle, wd.mode_echange AS dest_mode, u.nom_complet AS client_nom FROM demandes_echange d JOIN wallets ws ON ws.id = d.wallet_source_id JOIN wallets wd ON wd.id = d.wallet_dest_id JOIN utilisateurs u ON u.id = d.utilisateur_id ";
+async function demandeP(b, id, verrouiller = false) {
+  if (verrouiller && !await b.ligne("SELECT id FROM demandes_echange WHERE id = ? FOR UPDATE", [id])) return null;
+  return b.ligne(SELECTION_P + "WHERE d.id = ?", [id]);
+}
+function propre(v, max) {
+  return (typeof v === "string" ? v : "").replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, " ").substring(0, max);
+}
+function lireJson(t) {
+  if (!t) return {};
+  try {
+    const o = JSON.parse(t);
+    return o && typeof o === "object" ? o : {};
+  } catch (e) {
+    return {};
+  }
+}
+function expediteursParDefaut(operateur) {
+  return operateur === "DMONEY" ? "DMONEY" : "SALAAMBANK,WAAFI";
+}
+async function expediteursReconnus(b, operateur) {
+  const v = await b.valeur("SELECT valeur FROM parametres WHERE cle = ?", ["passerelle_expediteurs_" + operateur.toLowerCase()]);
+  return (v || expediteursParDefaut(operateur)).split(",").map(normaliserExpediteur).filter((x) => x.length > 0);
+}
+async function expediteurFiable(b, operateur, type, expediteur) {
+  if (type === "NOTIFICATION") {
+    const paquet = expediteur.toLowerCase();
+    if (!/^[a-z][a-z0-9_]*(\.[a-z0-9_]+)+$/.test(paquet)) return false;
+    return operateur === "WAAFI" ? paquet.indexOf("waafi") >= 0 : paquet.indexOf("dmoney") >= 0;
+  }
+  return (await expediteursReconnus(b, operateur)).indexOf(normaliserExpediteur(expediteur)) >= 0;
+}
+async function walletDe(b, operateur, verrouiller = false) {
+  return b.ligne(
+    "SELECT id, nom, mode_echange, seuil_alerte, solde_api, statut, compte_reception FROM wallets WHERE passerelle = ?" + (verrouiller ? " FOR UPDATE" : ""),
+    [operateur]
+  );
+}
+async function majSolde(b, operateur, solde) {
+  const w = await walletDe(b, operateur, true);
+  if (!w) return;
+  await b.exec("UPDATE wallets SET solde_api = ?, solde_maj = ? WHERE id = ?", [solde, Date.now(), w.id]);
+  if (solde !== w.solde_api) await alerterSolde(b, w, w.solde_api, solde);
+}
+async function creerOrdre(b, type, operateur, demandeId, motif, envoi) {
+  return b.inserer(
+    "INSERT INTO ordres_passerelle (type, operateur, demande_id, motif, montant, numero, statut, cle, date_creation) VALUES (?, ?, ?, ?, ?, ?, 'A_FAIRE', ?, ?)",
+    [type, operateur, demandeId, motif, envoi ? envoi.montant : null, envoi ? envoi.numero : null, envoi ? envoi.cle : null, Date.now()]
+  );
+}
+async function ordresDe(b, demandeId) {
+  return b.lignes("SELECT * FROM ordres_passerelle WHERE demande_id = ? ORDER BY id", [demandeId]);
+}
+async function annulerOrdresEnAttente(b, demandeId) {
+  await b.exec("UPDATE ordres_passerelle SET statut = 'ANNULE', date_fin = ? WHERE demande_id = ? AND statut = 'A_FAIRE'", [Date.now(), demandeId]);
+}
+async function envoiEnCours(b, demandeId) {
+  return !!await b.ligne("SELECT id FROM ordres_passerelle WHERE demande_id = ? AND type = 'ENVOI' AND statut = 'EN_COURS'", [demandeId]);
+}
+async function bloquer2(b, d, motif) {
+  const n = await b.exec(
+    "UPDATE demandes_echange SET etape_passerelle = 'BLOQUEE', motif_blocage = ?, date_blocage = ? WHERE id = ? AND statut = 'EN_COURS'",
+    [motif.substring(0, 500), Date.now(), d.id]
+  );
+  if (!n) return;
+  await annulerOrdresEnAttente(b, d.id);
+  await notifier(
+    b,
+    d.utilisateur_id,
+    "ECHANGE_BLOQUE",
+    "Échange en vérification",
+    "Votre échange " + d.reference + " est vérifié par un administrateur. Vous n’avez rien à faire : vous serez prévenu dès qu’il sera terminé.",
+    d.id
+  );
+  await notifierAdmins(b, "ECHANGE_BLOQUE", "Échange bloqué : " + d.reference, motif.substring(0, 300), d.id);
+  await journaliser(b, null, "PASSERELLE_BLOCAGE", d.reference + " : " + motif);
+}
+async function terminer(b, d, refDest) {
+  const commission = d.taux_commission != null ? pourcentageDe(d.montant, d.taux_commission) : 0;
+  const n = await b.exec("UPDATE demandes_echange SET statut = 'TRAITEE', etape_passerelle = NULL, motif_blocage = NULL, ref_api_dest = ?, date_traitement = ?, commission = ? WHERE id = ? AND statut = 'EN_COURS'", [refDest, Date.now(), commission, d.id]);
+  if (!n) return;
+  await notifier(
+    b,
+    d.utilisateur_id,
+    "ECHANGE_REUSSI",
+    "Échange réussi",
+    fdj(d.montant_net) + " envoyés au " + formatNumero(d.numero_dest) + " (" + d.dest_nom + "). Référence " + d.reference + ".",
+    d.id
+  );
+  await journaliser(b, null, "PASSERELLE_ENVOI", "Demande " + d.reference + " : " + fdj(d.montant_net) + " envoyés par la passerelle au " + formatNumero(d.numero_dest) + " (" + d.dest_nom + ", ID " + refDest + ")");
+}
+async function lancerEnvoi(b, d) {
+  if (!d.dest_passerelle) throw new Erreur("Le wallet " + d.dest_nom + " n’est pas géré par la passerelle.");
+  await b.exec("UPDATE demandes_echange SET etape_passerelle = 'ENVOI', motif_blocage = NULL, date_blocage = NULL WHERE id = ? AND statut = 'EN_COURS'", [d.id]);
+  await creerOrdre(b, "SOLDE", d.dest_passerelle, d.id, "AVANT_ENVOI");
+}
+async function raisonAccord(b, d) {
+  const p = await chargerParametres(b);
+  if (d.montant > p.passerelleMontantAuto) return "montant supérieur à " + fdj(p.passerelleMontantAuto);
+  if (p.passerelleDelaiSecondes > 0) {
+    const proche = await b.valeur(
+      "SELECT COUNT(*) AS n FROM demandes_echange WHERE id <> ? AND date_creation > ? AND date_creation <= ?",
+      [d.id, d.date_creation - p.passerelleDelaiSecondes * 1e3, d.date_creation]
+    );
+    if (Number(proche) > 0) return "une autre demande a été créée moins de " + p.passerelleDelaiSecondes + " secondes avant";
+  }
+  return null;
+}
+async function paiementProuve(b, d, op) {
+  await b.exec("UPDATE demandes_echange SET paiement_verifie = 1, ref_api_source = ? WHERE id = ?", [op.operation_id, d.id]);
+  const dd = await demandeP(b, d.id);
+  if (dd.dest_passerelle && dd.dest_mode === "AUTOMATIQUE") {
+    await envoyerOuDemanderAccord(b, dd, d.source_nom + ", ID " + op.operation_id);
+    return;
+  }
+  await b.exec("UPDATE demandes_echange SET etape_passerelle = NULL, motif_blocage = NULL WHERE id = ?", [d.id]);
+  await notifierAdmins(
+    b,
+    "DEMANDE_A_TRAITER",
+    "Nouvelle demande à traiter",
+    d.client_nom + " : " + d.source_nom + " → " + d.dest_nom + ", " + fdj(d.montant) + ". Paiement vérifié par la passerelle (ID " + op.operation_id + "), envoi à effectuer.",
+    d.id
+  );
+}
+async function envoyerOuDemanderAccord(b, d, preuve) {
+  const raison = await raisonAccord(b, d);
+  if (raison) {
+    await b.exec("UPDATE demandes_echange SET etape_passerelle = 'ATTENTE_ACCORD', motif_blocage = ? WHERE id = ?", ["Accord requis : " + raison, d.id]);
+    await notifierAdmins(
+      b,
+      "ACCORD_REQUIS",
+      "Accord requis : " + d.reference,
+      "Paiement de " + fdj(d.montant) + " vérifié (" + preuve + "). Envoi de " + fdj(d.montant_net) + " au " + formatNumero(d.numero_dest) + " (" + d.dest_nom + ") à autoriser : " + raison + ".",
+      d.id
+    );
+    return;
+  }
+  await lancerEnvoi(b, d);
+}
+async function envoyerApresApi(b, demandeId, refSource) {
+  const d = await demandeP(b, demandeId);
+  if (!d) throw new Erreur("Demande introuvable.");
+  await envoyerOuDemanderAccord(b, d, d.source_nom + ", réf. " + refSource);
+}
+async function enregistrerOperation(b, o, source, confirme) {
+  const t = Date.now();
+  const existante = await b.ligne("SELECT * FROM operations_operateur WHERE operateur = ? AND operation_id = ? FOR UPDATE", [o.operateur, o.operationId]);
+  if (!existante) {
+    await b.exec(
+      "INSERT INTO operations_operateur (operateur, operation_id, sens, montant, numero, nom, date_operation, solde_apres, source, confirme_operateur, utilisee, date_creation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?) ON CONFLICT (operateur, operation_id) DO NOTHING",
+      [o.operateur, o.operationId, o.sens, o.montant, o.numero, o.nom, o.date, o.soldeApres, source, confirme ? t : null, t]
+    );
+    return b.ligne("SELECT * FROM operations_operateur WHERE operateur = ? AND operation_id = ?", [o.operateur, o.operationId]);
+  }
+  const contradiction = o.sens && existante.sens && o.sens !== existante.sens || o.montant != null && existante.montant != null && o.montant !== existante.montant || o.numero && existante.numero && o.numero !== existante.numero;
+  if (contradiction) {
+    await notifierAdmins(
+      b,
+      "PASSERELLE_ALERTE",
+      "Message contradictoire (" + nomOperateur(o.operateur) + ")",
+      "L’identifiant " + o.operationId + " est déjà connu (" + (existante.sens || "?") + ", " + (existante.montant != null ? fdj(existante.montant) : "?") + ") mais un message (" + source + ") le décrit autrement. Le message est ignoré : vérifiez qu’il ne s’agit pas d’une fraude."
+    );
+    return null;
+  }
+  await b.exec(
+    "UPDATE operations_operateur SET sens = COALESCE(sens, ?), montant = COALESCE(montant, ?), numero = COALESCE(numero, ?), nom = COALESCE(nom, ?), date_operation = COALESCE(date_operation, ?), solde_apres = COALESCE(solde_apres, ?)" + (confirme ? ", confirme_operateur = COALESCE(confirme_operateur, ?)" : "") + " WHERE id = ?",
+    [o.sens, o.montant, o.numero, o.nom, o.date, o.soldeApres].concat(confirme ? [t] : []).concat([existante.id])
+  );
+  return b.ligne("SELECT * FROM operations_operateur WHERE id = ?", [existante.id]);
+}
+async function rattacherPaiement(b, d) {
+  const deja = await b.ligne("SELECT * FROM operations_operateur WHERE demande_id = ? AND role = 'PAIEMENT'", [d.id]);
+  if (deja) return deja;
+  if (!d.source_passerelle) return null;
+  const candidat = await b.ligne(
+    "SELECT * FROM operations_operateur WHERE operateur = ? AND sens = 'RECU' AND utilisee = 0 AND demande_id IS NULL AND montant = ? AND numero = ? AND COALESCE(date_operation, date_creation) >= ? ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED",
+    [d.source_passerelle, d.montant, d.numero_source, d.date_creation - TOLERANCE_AVANT_DEMANDE]
+  );
+  if (!candidat) return null;
+  const n = await b.exec("UPDATE operations_operateur SET demande_id = ?, role = 'PAIEMENT', utilisee = 1 WHERE id = ? AND utilisee = 0", [d.id, candidat.id]);
+  if (!n) return null;
+  await journaliser(b, null, "PASSERELLE_PAIEMENT", "Demande " + d.reference + " : paiement " + nomOperateur(d.source_passerelle) + " ID " + candidat.operation_id + " (" + fdj(d.montant) + " du " + formatNumero(d.numero_source) + ") rattaché");
+  return b.ligne("SELECT * FROM operations_operateur WHERE id = ?", [candidat.id]);
+}
+async function avancerVerification(b, d) {
+  const operateur = d.source_passerelle;
+  if (!operateur) {
+    await bloquer2(b, d, "Le wallet " + d.source_nom + " n’est plus lu par la passerelle : vérifiez le paiement à la main.");
+    return;
+  }
+  const t = Date.now();
+  const debut = d.date_confirmation || d.date_creation;
+  const ordres = await ordresDe(b, d.id);
+  const enAttente = ordres.some((o) => o.statut === "A_FAIRE" || o.statut === "EN_COURS");
+  const p = await rattacherPaiement(b, d);
+  if (!p) {
+    if (t - debut > DELAI_VERIFICATION) {
+      await bloquer2(b, d, "Paiement introuvable : aucun message " + nomOperateur(operateur) + " ne correspond (" + fdj(d.montant) + " du " + formatNumero(d.numero_source) + ") depuis la confirmation du client.");
+      return;
+    }
+    const recherches = ordres.filter((o) => o.motif === "RECHERCHE");
+    if (operateur === "WAAFI" && !enAttente && t - debut > DELAI_RECHERCHE_WAAFI && recherches.length < 2 && (!recherches.length || t - (recherches[recherches.length - 1].date_fin || 0) > 2 * MINUTE2) && !await b.ligne("SELECT id FROM ordres_passerelle WHERE operateur = 'WAAFI' AND type = 'HISTORIQUE' AND statut IN ('A_FAIRE', 'EN_COURS') LIMIT 1")) {
+      await creerOrdre(b, "HISTORIQUE", "WAAFI", d.id, "RECHERCHE");
+    }
+    return;
+  }
+  if (!p.confirme_operateur) {
+    if (enAttente) return;
+    const verifs = ordres.filter((o) => o.type === "HISTORIQUE");
+    if (verifs.length >= MAX_HISTORIQUES) {
+      await bloquer2(b, d, "Paiement " + nomOperateur(operateur) + " ID " + p.operation_id + " non retrouvé dans l’historique de l’opérateur après " + verifs.length + " consultations : message de réception douteux, ou historique trop chargé.");
+      return;
+    }
+    const derniere = verifs[verifs.length - 1];
+    if (!derniere || t - (derniere.date_fin || derniere.date_creation) >= ECART_HISTORIQUES) {
+      const prevue = await b.ligne(
+        "SELECT id FROM ordres_passerelle WHERE operateur = ? AND type = 'HISTORIQUE' AND statut IN ('A_FAIRE', 'EN_COURS') LIMIT 1",
+        [operateur]
+      );
+      if (!prevue) await creerOrdre(b, "HISTORIQUE", operateur, d.id, "VERIFICATION");
+    }
+    return;
+  }
+  if (operateur === "WAAFI" && p.source !== "NOTIFICATION") {
+    const controles = ordres.filter((o) => o.motif === "CONTROLE_SOLDE");
+    const fait = controles.find((o) => o.statut === "FAIT" && lireJson(o.resultat).coherent === true);
+    if (!fait) {
+      if (enAttente) return;
+      const rate = controles.find((o) => o.statut === "FAIT" && lireJson(o.resultat).coherent === false);
+      if (rate) return;
+      if (controles.filter((o) => o.statut === "ECHEC").length >= MAX_ESSAIS_LECTURE) {
+        await bloquer2(b, d, "Solde Waafi illisible : le contrôle du paiement ID " + p.operation_id + " n’a pas pu être fait.");
+        return;
+      }
+      await creerOrdre(b, "SOLDE", "WAAFI", d.id, "CONTROLE_SOLDE");
+      return;
+    }
+  }
+  await paiementProuve(b, d, p);
+}
+async function traiterMessage(passerelleId, m) {
+  await transaction(async (b) => {
+    const id = await b.valeur(
+      "INSERT INTO messages_passerelle (passerelle_id, id_local, type, expediteur, texte, recu_a, date_reception) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (passerelle_id, id_local) DO NOTHING RETURNING id",
+      [passerelleId, m.idLocal, m.type, m.expediteur, m.texte, m.recuA, Date.now()]
+    );
+    if (!id) return;
+    const a2 = analyserMessage(m.texte);
+    if (!a2.operateur || !a2.nature) {
+      await b.exec("UPDATE messages_passerelle SET nature = 'IGNORE', lecture = ? WHERE id = ?", [a2.resume, id]);
+      return;
+    }
+    if (!await expediteurFiable(b, a2.operateur, m.type, m.expediteur)) {
+      await b.exec(
+        "UPDATE messages_passerelle SET operateur = ?, nature = 'NON_FIABLE', lecture = ? WHERE id = ?",
+        [a2.operateur, "Expéditeur non reconnu : " + a2.resume, id]
+      );
+      if (a2.operations.length) {
+        await notifierAdmins(
+          b,
+          "PASSERELLE_ALERTE",
+          "Message suspect ignoré",
+          "Un message qui ressemble à " + nomOperateur(a2.operateur) + " est arrivé de « " + m.expediteur.substring(0, 40) + " » (" + a2.resume + "). Il est ignoré. Si c’est bien l’opérateur, ajoutez cet expéditeur dans l’écran Passerelle."
+        );
+      }
+      return;
+    }
+    await b.exec("UPDATE messages_passerelle SET operateur = ?, nature = ?, lecture = ? WHERE id = ?", [a2.operateur, a2.nature, a2.resume, id]);
+    const source = m.type === "NOTIFICATION" ? "NOTIFICATION" : a2.nature === "RELEVE" ? "RELEVE" : "SMS";
+    for (const o of a2.operations) await enregistrerOperation(b, o, source, false);
+    if (a2.solde != null && (a2.nature === "RECEPTION" || a2.nature === "ENVOI" || a2.nature === "SOLDE")) await majSolde(b, a2.operateur, a2.solde);
+    if (a2.nature === "RELEVE" && a2.operateur === "WAAFI") await rattacherReleveWaafi(b, a2.operations);
+    if (a2.nature === "ENVOI") for (const o of a2.operations) await resoudreEnvoiIncertain(b, o);
+  });
+}
+async function rattacherReleveWaafi(b, ops) {
+  const ordre = await b.ligne("SELECT * FROM ordres_passerelle WHERE operateur = 'WAAFI' AND type = 'HISTORIQUE' AND statut = 'FAIT' AND date_fin >= ? ORDER BY id DESC LIMIT 1 FOR UPDATE", [Date.now() - DELAI_RELEVE_WAAFI]);
+  if (!ordre) return;
+  const r = lireJson(ordre.resultat);
+  if (r.releve) return;
+  for (const o of ops) await enregistrerOperation(b, o, "RELEVE", true);
+  r.releve = true;
+  await b.exec("UPDATE ordres_passerelle SET resultat = ? WHERE id = ?", [JSON.stringify(r), ordre.id]);
+}
+async function resoudreEnvoiIncertain(b, o) {
+  if (o.sens !== "ENVOYE" || o.montant == null) return;
+  const op = await b.ligne("SELECT * FROM operations_operateur WHERE operateur = ? AND operation_id = ?", [o.operateur, o.operationId]);
+  if (!op || op.demande_id) return;
+  const quand = o.date || Date.now();
+  const ordre = await b.ligne(
+    "SELECT * FROM ordres_passerelle WHERE type = 'ENVOI' AND operateur = ? AND statut IN ('INCERTAIN', 'EN_COURS') AND montant = ? AND date_prise IS NOT NULL AND date_prise <= ? AND date_prise >= ? " + (o.numero ? "AND numero = ? " : "") + "ORDER BY id DESC LIMIT 1 FOR UPDATE",
+    [o.operateur, o.montant, quand + MINUTE2, Date.now() - DELAI_RESOLUTION_ENVOI].concat(o.numero ? [o.numero] : [])
+  );
+  if (!ordre || !ordre.demande_id) return;
+  await b.exec("UPDATE operations_operateur SET demande_id = ?, role = 'VERSEMENT', utilisee = 1 WHERE id = ? AND demande_id IS NULL", [ordre.demande_id, op.id]);
+  await b.exec(
+    "UPDATE ordres_passerelle SET statut = 'FAIT', date_fin = ?, erreur = ? WHERE id = ?",
+    [Date.now(), "Confirmé par le SMS de l’opérateur (ID " + o.operationId + ")", ordre.id]
+  );
+  const d = await demandeP(b, ordre.demande_id, true);
+  if (!d) return;
+  if (d.statut === "EN_COURS") {
+    await terminer(b, d, o.operationId);
+    await notifierAdmins(
+      b,
+      "PASSERELLE_INFO",
+      "Envoi confirmé : " + d.reference,
+      "L’envoi de " + fdj(d.montant_net) + " au " + formatNumero(d.numero_dest) + " a bien eu lieu (SMS de l’opérateur, ID " + o.operationId + ") : la demande est traitée.",
+      d.id
+    );
+  } else if (d.statut === "TRAITEE") {
+    await notifierAdmins(
+      b,
+      "PASSERELLE_ALERTE",
+      "Double envoi possible : " + d.reference,
+      "L’envoi automatique de " + fdj(d.montant_net) + " au " + formatNumero(d.numero_dest) + " a finalement réussi (ID " + o.operationId + ") alors que la demande a été traitée à la main. Vérifiez si le client a été payé deux fois.",
+      d.id
+    );
+  }
+}
+function lireResultat(v) {
+  const o = objet(v, "résultat");
+  return {
+    ordreId: entier(o.ordreId, "ordre", 1),
+    statut: parmi(o.statut, ["FAIT", "ECHEC", "INCERTAIN"], "statut de l’ordre"),
+    ecrans: tableau(o.ecrans, "écrans", 30).map((e) => propre(e, 1500)),
+    sms: tableau(o.sms, "SMS", 5).map((x) => {
+      const s2 = objet(x, "SMS");
+      return { expediteur: propre(s2.expediteur, 100), texte: propre(s2.texte, 2e3), recuA: Number(s2.recuA) || Date.now() };
+    }),
+    pinSaisi: booleen(o.pinSaisi),
+    erreur: propre(o.erreur, 300)
+  };
+}
+async function terminerOrdre(b, ordre, statut, resultat, erreur) {
+  await b.exec(
+    "UPDATE ordres_passerelle SET statut = ?, resultat = ?, erreur = ?, date_fin = ? WHERE id = ?",
+    [statut, JSON.stringify(resultat).substring(0, 2e4), erreur ? erreur.substring(0, 500) : null, Date.now(), ordre.id]
+  );
+}
+async function traiterResultat(r) {
+  await transaction(async (b) => {
+    const ordre = await b.ligne("SELECT * FROM ordres_passerelle WHERE id = ? FOR UPDATE", [r.ordreId]);
+    if (!ordre || ordre.statut !== "EN_COURS") return;
+    const resultat = { ecrans: r.ecrans, pinSaisi: r.pinSaisi };
+    const d = ordre.demande_id ? await demandeP(b, ordre.demande_id, true) : null;
+    const actif = !!d && d.statut === "EN_COURS";
+    if (ordre.type === "SOLDE") {
+      const soldes = r.ecrans.map((e) => lireEcranSolde(ordre.operateur, e)).filter((x) => x != null);
+      const solde = soldes.length ? soldes[soldes.length - 1] : null;
+      if (solde == null) {
+        await echecLecture(b, ordre, resultat, r.erreur || "Solde illisible à l’écran", d);
+        return;
+      }
+      resultat.solde = solde;
+      await majSolde(b, ordre.operateur, solde);
+      if (ordre.motif === "CONTROLE_SOLDE" && d && actif) {
+        const paiement = await b.ligne("SELECT * FROM operations_operateur WHERE demande_id = ? AND role = 'PAIEMENT'", [d.id]);
+        const attendu = paiement ? await soldeAttendu(b, ordre.operateur, ordre.id, paiement) : null;
+        resultat.attendu = attendu;
+        resultat.coherent = attendu != null && solde >= attendu;
+        await terminerOrdre(b, ordre, "FAIT", resultat, null);
+        if (!resultat.coherent) {
+          await bloquer2(b, d, attendu == null ? "Solde " + nomOperateur(ordre.operateur) + " impossible à contrôler : aucun solde lu à l’écran avant ce paiement. Vérifiez le paiement sur le téléphone (puis « Valider le paiement »)." : "Solde " + nomOperateur(ordre.operateur) + " incohérent : " + fdj(solde) + " affiché par l’opérateur, au moins " + fdj(attendu) + " attendu avec ce paiement. Le message de réception est peut-être faux : vérifiez sur le téléphone.");
+        }
+        return;
+      }
+      await terminerOrdre(b, ordre, "FAIT", resultat, null);
+      if (ordre.motif === "AVANT_ENVOI" && d && actif && d.etape_passerelle === "ENVOI") {
+        if (solde < d.montant_net) {
+          await bloquer2(b, d, "Solde " + nomOperateur(ordre.operateur) + " insuffisant : " + fdj(solde) + " pour un envoi de " + fdj(d.montant_net) + ". Rechargez le compte, puis relancez l’envoi.");
+          return;
+        }
+        const n = (await ordresDe(b, d.id)).filter((o) => o.type === "ENVOI").length + 1;
+        await creerOrdre(b, "ENVOI", ordre.operateur, d.id, "ENVOI", { montant: d.montant_net, numero: d.numero_dest, cle: "ENVOI-" + d.id + "-" + n });
+      }
+      return;
+    }
+    if (ordre.type === "HISTORIQUE") {
+      if (ordre.operateur === "DMONEY") {
+        const lignes = r.ecrans.map(lireEcranHistoriqueDmoney).filter((l) => l.length).pop() || [];
+        if (!lignes.length) {
+          await echecLecture(b, ordre, resultat, r.erreur || "Historique illisible à l’écran", d);
+          return;
+        }
+        resultat.lignes = lignes;
+        for (const l of lignes) await confirmerParHistorique(b, l);
+      } else {
+        if (!r.ecrans.some(releveWaafiEnvoye)) {
+          await echecLecture(b, ordre, resultat, r.erreur || "Mini-relevé non envoyé par Waafi", d);
+          return;
+        }
+        resultat.releve = false;
+        for (const s2 of r.sms) {
+          if (!await expediteurFiable(b, "WAAFI", "SMS", s2.expediteur)) continue;
+          const ops = lireReleveWaafi(s2.texte);
+          if (!ops.length) continue;
+          for (const o of ops) await enregistrerOperation(b, o, "RELEVE", true);
+          resultat.releve = true;
+          resultat.operations = ops.map((o) => o.operationId);
+        }
+      }
+      await terminerOrdre(b, ordre, "FAIT", resultat, null);
+      return;
+    }
+    const lu = r.ecrans.map((e) => lireEcranEnvoi(ordre.operateur, e)).filter((x) => !!x).pop() || null;
+    if (lu) {
+      resultat.operation = lu.operationId;
+      resultat.montantEcran = lu.montant;
+      resultat.soldeEcran = lu.soldeApres;
+      const op = await enregistrerOperation(b, lu, "ECRAN", true);
+      if (op && !op.demande_id && d) {
+        await b.exec("UPDATE operations_operateur SET demande_id = ?, role = 'VERSEMENT', utilisee = 1 WHERE id = ?", [d.id, op.id]);
+      }
+      if (lu.soldeApres != null) await majSolde(b, ordre.operateur, lu.soldeApres);
+      await terminerOrdre(b, ordre, "FAIT", resultat, null);
+      if (!d) return;
+      if (lu.montant !== ordre.montant || lu.numero && lu.numero !== ordre.numero) {
+        await bloquer2(b, d, "Envoi effectué mais différent de la demande (ID " + lu.operationId + " : " + (lu.montant != null ? fdj(lu.montant) : "?") + (lu.numero ? " au " + formatNumero(lu.numero) : "") + " au lieu de " + fdj(ordre.montant || 0) + " au " + formatNumero(ordre.numero) + ").");
+        return;
+      }
+      if (actif) await terminer(b, d, lu.operationId);
+      return;
+    }
+    if (r.statut === "ECHEC") {
+      await terminerOrdre(b, ordre, "ECHEC", resultat, r.erreur || "Échec");
+      if (d && actif) {
+        await bloquer2(b, d, "Envoi automatique impossible, aucun argent n’est parti" + (r.pinSaisi ? " (refus de l’opérateur)" : "") + " : " + (r.erreur || "échec") + ". Vous pouvez relancer l’envoi, l’effectuer à la main ou refuser la demande.");
+      }
+      return;
+    }
+    await terminerOrdre(b, ordre, "INCERTAIN", resultat, r.erreur || "Issue inconnue");
+    if (d && actif) await bloquerIncertain(b, d, ordre, r.erreur || "pas d’écran de confirmation");
+  });
+}
+async function bloquerIncertain(b, d, ordre, raison) {
+  await bloquer2(b, d, "Envoi incertain (" + raison + ") : la passerelle ne sait pas si " + fdj(ordre.montant || 0) + " sont partis vers le " + formatNumero(ordre.numero) + ". Vérifiez l’historique " + nomOperateur(ordre.operateur) + " avant toute action : si l’argent est parti, confirmez la demande ; sinon, relancez l’envoi. La demande sera confirmée seule si le SMS de l’opérateur arrive.");
+}
+async function soldeAttendu(b, operateur, ordreId, p) {
+  const points = await b.lignes(
+    "SELECT type, resultat, date_fin FROM ordres_passerelle WHERE operateur = ? AND statut = 'FAIT' AND type IN ('SOLDE', 'ENVOI') AND id <> ? AND date_fin < ? ORDER BY date_fin DESC, id DESC LIMIT 10",
+    [operateur, ordreId, p.date_creation]
+  );
+  let base2 = null;
+  let quand = 0;
+  for (const pt of points) {
+    const r = lireJson(pt.resultat);
+    const v = pt.type === "SOLDE" ? r.solde : r.soldeEcran;
+    if (typeof v === "number" && isFinite(v)) {
+      base2 = v;
+      quand = Number(pt.date_fin);
+      break;
+    }
+  }
+  if (base2 == null || p.montant == null) return null;
+  const recus = Number(await b.valeur(
+    "SELECT COALESCE(SUM(montant), 0) AS s FROM operations_operateur WHERE operateur = ? AND sens = 'RECU' AND montant IS NOT NULL AND id <> ? AND date_creation > ? AND NOT (source = 'RELEVE' AND date_operation IS NOT NULL AND date_operation < ?)",
+    [operateur, p.id, quand, quand - 5 * MINUTE2]
+  ));
+  const envois = await b.lignes("SELECT resultat FROM ordres_passerelle WHERE operateur = ? AND type = 'ENVOI' AND statut = 'FAIT' AND date_fin > ?", [operateur, quand]);
+  const envoye = envois.map((o) => lireJson(o.resultat).montantEcran).filter((m) => typeof m === "number" && isFinite(m)).reduce((s2, m) => s2 + m, 0);
+  return base2 + Number(p.montant) + recus - envoye;
+}
+async function echecLecture(b, ordre, resultat, erreur, d) {
+  await terminerOrdre(b, ordre, "ECHEC", resultat, erreur);
+  if (!d || d.statut !== "EN_COURS") return;
+  const memes = (await ordresDe(b, d.id)).filter((o) => o.type === ordre.type && o.motif === ordre.motif && o.statut === "ECHEC").length;
+  if (memes < MAX_ESSAIS_LECTURE) {
+    if (ordre.motif === "AVANT_ENVOI" || ordre.motif === "CONTROLE_SOLDE") await creerOrdre(b, ordre.type, ordre.operateur, d.id, ordre.motif);
+    return;
+  }
+  await bloquer2(b, d, (ordre.type === "SOLDE" ? "Lecture du solde " : "Lecture de l’historique ") + nomOperateur(ordre.operateur) + " impossible après " + memes + " essais (" + erreur + ").");
+}
+async function confirmerParHistorique(b, l) {
+  const op = await b.ligne("SELECT * FROM operations_operateur WHERE operateur = 'DMONEY' AND operation_id = ? FOR UPDATE", [l.operationId]);
+  const t = Date.now();
+  if (!op) {
+    await b.exec("INSERT INTO operations_operateur (operateur, operation_id, montant, date_operation, source, confirme_operateur, utilisee, date_creation) VALUES ('DMONEY', ?, ?, ?, 'ECRAN', ?, 0, ?) ON CONFLICT (operateur, operation_id) DO NOTHING", [l.operationId, l.montant, l.date, t, t]);
+    return;
+  }
+  if (op.confirme_operateur) return;
+  const montantOk = op.montant == null || l.montant == null || op.montant === l.montant;
+  const dateOk = op.date_operation == null || l.date == null || Math.abs(op.date_operation - l.date) <= 2 * MINUTE2;
+  if (!montantOk || !dateOk) {
+    await notifierAdmins(
+      b,
+      "PASSERELLE_ALERTE",
+      "Historique D-Money différent du SMS",
+      "L’opération " + l.operationId + " apparaît dans l’historique avec " + (l.montant != null ? fdj(l.montant) : "?") + ", mais le SMS reçu annonçait " + (op.montant != null ? fdj(op.montant) : "?") + ". Le SMS est peut-être faux."
+    );
+    return;
+  }
+  await b.exec("UPDATE operations_operateur SET confirme_operateur = ?, montant = COALESCE(montant, ?) WHERE id = ?", [t, l.montant, op.id]);
+}
+var avancementEnCours = null;
+var avancementDemande = false;
+function avancer() {
+  if (avancementEnCours) {
+    avancementDemande = true;
+    return avancementEnCours;
+  }
+  avancementEnCours = (async () => {
+    try {
+      do {
+        avancementDemande = false;
+        await unPassage();
+      } while (avancementDemande);
+    } finally {
+      avancementEnCours = null;
+    }
+  })();
+  return avancementEnCours;
+}
+async function unPassage() {
+  try {
+    await expirerOrdres();
+  } catch (e) {
+    console.error("[passerelle] délais des ordres :", e && e.message);
+  }
+  const ids = await base().lignes("SELECT id FROM demandes_echange WHERE statut = 'EN_COURS' AND etape_passerelle = 'VERIF_PAIEMENT' ORDER BY id");
+  for (const { id } of ids) {
+    try {
+      await transaction(async (b) => {
+        const d = await demandeP(b, id, true);
+        if (d && d.statut === "EN_COURS" && d.etape_passerelle === "VERIF_PAIEMENT") await avancerVerification(b, d);
+      });
+    } catch (e) {
+      console.error("[passerelle] demande " + id + " :", e && e.message);
+    }
+  }
+}
+function declencher() {
+  avancer().catch((e) => console.error("[passerelle] avancement :", e && e.message));
+}
+async function expirerOrdres() {
+  const t = Date.now();
+  const expires = await base().lignes(
+    "SELECT id FROM ordres_passerelle WHERE (statut = 'EN_COURS' AND date_prise < ?) OR (statut = 'A_FAIRE' AND date_creation < ?) ORDER BY id",
+    [t - DELAI_ORDRE, t - DELAI_ORDRE_NON_PRIS]
+  );
+  for (const { id } of expires) {
+    await transaction(async (b) => {
+      const ordre = await b.ligne("SELECT * FROM ordres_passerelle WHERE id = ? FOR UPDATE", [id]);
+      if (!ordre) return;
+      const d = ordre.demande_id ? await demandeP(b, ordre.demande_id, true) : null;
+      const actif = !!d && d.statut === "EN_COURS";
+      if (ordre.statut === "A_FAIRE" && ordre.date_creation < t - DELAI_ORDRE_NON_PRIS) {
+        await terminerOrdre(b, ordre, "ANNULE", {}, "Jamais pris par le téléphone passerelle");
+        if (d && actif) {
+          await bloquer2(b, d, "Téléphone passerelle injoignable : l’ordre " + ordre.type.toLowerCase() + " " + nomOperateur(ordre.operateur) + " n’a pas été exécuté en " + Math.round(DELAI_ORDRE_NON_PRIS / MINUTE2) + " minutes. Aucun envoi n’a été fait.");
+        }
+        return;
+      }
+      if (ordre.statut !== "EN_COURS" || !ordre.date_prise || ordre.date_prise >= t - DELAI_ORDRE) return;
+      if (ordre.type === "ENVOI") {
+        await terminerOrdre(b, ordre, "INCERTAIN", {}, "Aucun résultat du téléphone");
+        if (d && actif) await bloquerIncertain(b, d, ordre, "aucun résultat du téléphone");
+        return;
+      }
+      if (ordre.tentatives < MAX_ESSAIS_LECTURE) {
+        await b.exec("UPDATE ordres_passerelle SET statut = 'A_FAIRE', date_prise = NULL, date_creation = ? WHERE id = ?", [t, ordre.id]);
+        return;
+      }
+      await echecLecture(b, ordre, {}, "Aucun résultat du téléphone", d);
+    });
+  }
+}
+async function passerelleParJeton(jeton) {
+  if (!/^[0-9a-f]{64}$/.test(jeton)) return null;
+  return base().ligne("SELECT id FROM passerelles WHERE jeton_hash = ? AND actif = 1", [sha256Hex(jeton)]);
+}
+async function creerCode(acteur) {
+  exigerRole(acteur, ["SUPER_ADMIN"]);
+  let code = "";
+  for (let i = 0; i < 8; i++) code += ALPHABET_CODE.charAt(aleaEntier(ALPHABET_CODE.length));
+  const expire = Date.now() + 10 * MINUTE2;
+  await transaction(async (b) => {
+    const p = await b.ligne("SELECT id FROM passerelles ORDER BY id LIMIT 1 FOR UPDATE");
+    if (p) await b.exec("UPDATE passerelles SET code_hash = ?, code_expire = ? WHERE id = ?", [sha256Hex(code), expire, p.id]);
+    else await b.exec("INSERT INTO passerelles (nom, code_hash, code_expire, actif, date_creation) VALUES (?, ?, ?, 0, ?)", ["Téléphone passerelle", sha256Hex(code), expire, Date.now()]);
+    await journaliser(b, acteur.id, "PASSERELLE_CODE", "Code d’association de la passerelle créé (valable 10 minutes)");
+  });
+  return { code, expire };
+}
+async function associer(args) {
+  const code = texte(args.code, "code", 40).toUpperCase().replace(/[^A-Z0-9]/g, "");
+  if (code.length !== 8) throw new Erreur("Code d’association invalide ou expiré.");
+  const appareil = args.appareil && typeof args.appareil === "object" ? args.appareil : {};
+  const nom = propre(appareil.modele, 60).trim() || "Téléphone passerelle";
+  const jeton = aleaHex(32);
+  await transaction(async (b) => {
+    const p = await b.ligne("SELECT id FROM passerelles WHERE code_hash = ? AND code_expire > ? FOR UPDATE", [sha256Hex(code), Date.now()]);
+    if (!p) throw new Erreur("Code d’association invalide ou expiré.");
+    await b.exec(
+      "UPDATE passerelles SET jeton_hash = ?, code_hash = NULL, code_expire = NULL, actif = 1, nom = ?, date_association = ?, dernier_contact = ? WHERE id = ?",
+      [sha256Hex(jeton), nom, Date.now(), Date.now(), p.id]
+    );
+    await journaliser(b, null, "PASSERELLE_ASSOCIATION", "Téléphone passerelle associé : " + nom);
+    await notifierAdmins(b, "PASSERELLE_INFO", "Téléphone passerelle associé", nom + " est maintenant le téléphone passerelle.");
+  });
+  return { jeton };
+}
+async function dissocier(acteur) {
+  exigerRole(acteur, ["SUPER_ADMIN"]);
+  await transaction(async (b) => {
+    await b.exec("UPDATE passerelles SET actif = 0, jeton_hash = NULL, code_hash = NULL, code_expire = NULL");
+    await journaliser(b, acteur.id, "PASSERELLE_DISSOCIATION", "Téléphone passerelle dissocié");
+  });
+}
+async function synchroniser(passerelleId, args) {
+  const etat2 = args.etat && typeof args.etat === "object" && !Array.isArray(args.etat) ? args.etat : {};
+  const etatTexte = JSON.stringify(etat2).substring(0, 2e3);
+  await base().exec("UPDATE passerelles SET dernier_contact = ?, etat = ? WHERE id = ?", [Date.now(), etatTexte, passerelleId]);
+  const resultats = tableau(args.resultats, "résultats", 10).map(lireResultat);
+  const messages = tableau(args.messages, "messages", 50).map((brut) => {
+    const o = objet(brut, "message");
+    const m = {
+      idLocal: propre(o.id, 80).trim(),
+      type: parmi(o.type, ["SMS", "NOTIFICATION"], "type de message"),
+      expediteur: propre(o.expediteur, 100).trim() || "?",
+      texte: propre(o.texte, 2e3),
+      recuA: Math.max(0, Number(o.recuA) || Date.now())
+    };
+    if (!m.idLocal) throw new Erreur("Message sans identifiant.");
+    return m;
+  });
+  const resultatsAcquittes = [];
+  for (const r of resultats) {
+    await traiterResultat(r);
+    resultatsAcquittes.push(r.ordreId);
+  }
+  const acquittes = [];
+  for (const m of messages) {
+    await traiterMessage(passerelleId, m);
+    acquittes.push(m.idLocal);
+  }
+  await avancer();
+  const ordre = await transaction(async (b) => {
+    if (await b.ligne("SELECT id FROM ordres_passerelle WHERE statut = 'EN_COURS' LIMIT 1")) return null;
+    const o = await b.ligne("SELECT * FROM ordres_passerelle WHERE statut = 'A_FAIRE' ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED");
+    if (!o) return null;
+    await b.exec("UPDATE ordres_passerelle SET statut = 'EN_COURS', date_prise = ?, tentatives = tentatives + 1 WHERE id = ?", [Date.now(), o.id]);
+    return o;
+  });
+  const actif = !!ordre || !!await base().ligne("SELECT id FROM ordres_passerelle WHERE statut IN ('A_FAIRE', 'EN_COURS') LIMIT 1") || !!await base().ligne("SELECT id FROM demandes_echange WHERE statut IN ('EN_ATTENTE', 'EN_COURS') AND (etape_passerelle IN ('VERIF_PAIEMENT', 'ENVOI') OR (statut = 'EN_ATTENTE' AND date_creation > ?)) LIMIT 1", [Date.now() - 30 * MINUTE2]);
+  return {
+    acquittes,
+    resultatsAcquittes,
+    ordres: ordre ? [{ id: ordre.id, type: ordre.type, operateur: ordre.operateur, montant: ordre.montant, numero: ordre.numero }] : [],
+    prochainAppel: actif ? 10 : 60
+  };
+}
+async function commencerVerification(b, demandeId) {
+  await b.exec("UPDATE demandes_echange SET etape_passerelle = 'VERIF_PAIEMENT', motif_blocage = NULL WHERE id = ?", [demandeId]);
+}
+async function envoyerApresAttestation(b, demandeId) {
+  const d = await demandeP(b, demandeId);
+  if (!d) throw new Erreur("Demande introuvable.");
+  await b.exec("UPDATE demandes_echange SET paiement_verifie = CASE WHEN paiement_verifie = 0 THEN 2 ELSE paiement_verifie END WHERE id = ?", [d.id]);
+  await lancerEnvoi(b, d);
+}
+async function demandeAdmin(b, args) {
+  const id = entier(args.id, "demande", 1);
+  const d = await demandeP(b, id, true);
+  if (!d) throw new Erreur("Demande introuvable.");
+  if (d.statut !== "EN_COURS" || !d.etape_passerelle) throw new Erreur("Cette demande n’est pas traitée par la passerelle.");
+  return d;
+}
+async function autoriserEnvoi(acteur, args) {
+  exigerRole(acteur, ["ADMIN", "SUPER_ADMIN"]);
+  await transaction(async (b) => {
+    const d = await demandeAdmin(b, args);
+    if (d.etape_passerelle !== "ATTENTE_ACCORD" && d.etape_passerelle !== "BLOQUEE") throw new Erreur("L’envoi de cette demande est déjà en cours.");
+    if (!d.paiement_verifie) throw new Erreur("Le paiement du client n’est pas encore vérifié : validez-le d’abord.");
+    if (!d.dest_passerelle || d.dest_mode !== "AUTOMATIQUE") throw new Erreur("Le wallet " + d.dest_nom + " n’est pas en envoi automatique par la passerelle.");
+    const envois = (await ordresDe(b, d.id)).filter((o) => o.type === "ENVOI");
+    if (envois.some((o) => o.statut === "EN_COURS" || o.statut === "A_FAIRE")) throw new Erreur("Un envoi automatique est déjà en cours.");
+    if (envois.some((o) => o.statut === "INCERTAIN" || o.statut === "FAIT") && !booleen(args.verifie)) {
+      throw new Erreur("Un envoi a peut-être déjà eu lieu : vérifiez l’historique " + d.dest_nom + " et confirmez que l’argent n’est pas parti.");
+    }
+    await lancerEnvoi(b, d);
+    await journaliser(b, acteur.id, "PASSERELLE_ACCORD", "Envoi automatique autorisé pour la demande " + d.reference + " (" + fdj(d.montant_net) + ")");
+  });
+  declencher();
+}
+async function validerPaiement(acteur, args) {
+  exigerRole(acteur, ["ADMIN", "SUPER_ADMIN"]);
+  await transaction(async (b) => {
+    const d = await demandeAdmin(b, args);
+    if (d.paiement_verifie) throw new Erreur("Le paiement est déjà vérifié.");
+    if (d.etape_passerelle !== "VERIF_PAIEMENT" && d.etape_passerelle !== "BLOQUEE") throw new Erreur("Action impossible à cette étape.");
+    await annulerOrdresEnAttente(b, d.id);
+    await b.exec("UPDATE demandes_echange SET paiement_verifie = 2 WHERE id = ?", [d.id]);
+    await journaliser(b, acteur.id, "PASSERELLE_PAIEMENT_MANUEL", "Paiement de la demande " + d.reference + " vérifié à la main (" + fdj(d.montant) + ")");
+    if (d.dest_passerelle && d.dest_mode === "AUTOMATIQUE") {
+      await lancerEnvoi(b, d);
+    } else {
+      await b.exec("UPDATE demandes_echange SET etape_passerelle = NULL, motif_blocage = NULL WHERE id = ?", [d.id]);
+    }
+  });
+  declencher();
+}
+async function preparerDecisionManuelle(b, demandeId) {
+  if (await envoiEnCours(b, demandeId)) {
+    throw new Erreur("Un envoi automatique est en cours sur le téléphone passerelle : attendez son résultat (quelques minutes au plus).");
+  }
+  await annulerOrdresEnAttente(b, demandeId);
+  await b.exec("UPDATE demandes_echange SET etape_passerelle = NULL WHERE id = ?", [demandeId]);
+}
+async function etat(acteur) {
+  exigerRole(acteur, ["SUPER_ADMIN"]);
+  const b = base();
+  const p = await b.ligne("SELECT id, nom, actif, etat, code_expire, date_association, dernier_contact FROM passerelles ORDER BY id LIMIT 1");
+  const wallets = await b.lignes("SELECT id, nom, passerelle, statut, mode_echange, type_compte, compte_reception, solde_api, solde_maj FROM wallets ORDER BY ordre, id");
+  const ordres = await b.lignes("SELECT o.id, o.type, o.operateur, o.motif, o.montant, o.numero, o.statut, o.tentatives, o.erreur, o.date_creation, o.date_prise, o.date_fin, d.reference FROM ordres_passerelle o LEFT JOIN demandes_echange d ON d.id = o.demande_id ORDER BY o.id DESC LIMIT 20");
+  const operations = await b.lignes("SELECT o.id, o.operateur, o.operation_id, o.sens, o.montant, o.numero, o.nom, o.date_operation, o.solde_apres, o.source, o.confirme_operateur, o.role, o.utilisee, o.date_creation, d.reference FROM operations_operateur o LEFT JOIN demandes_echange d ON d.id = o.demande_id ORDER BY o.id DESC LIMIT 30");
+  const messages = await b.lignes("SELECT id, type, expediteur, operateur, nature, lecture, recu_a, date_reception FROM messages_passerelle ORDER BY id DESC LIMIT 20");
+  const expediteurs = {
+    DMONEY: (await expediteursReconnus(b, "DMONEY")).join(", "),
+    WAAFI: (await expediteursReconnus(b, "WAAFI")).join(", ")
+  };
+  return {
+    passerelle: p ? {
+      nom: p.nom,
+      associe: p.actif === 1,
+      etat: lireJson(p.etat),
+      codeExpire: p.code_expire && p.code_expire > Date.now() ? p.code_expire : null,
+      dateAssociation: p.date_association,
+      dernierContact: p.dernier_contact
+    } : null,
+    wallets,
+    ordres,
+    operations,
+    messages,
+    expediteurs
+  };
+}
+async function affecterWallet(acteur, args) {
+  exigerRole(acteur, ["SUPER_ADMIN"]);
+  const operateur = parmi(args.operateur, ["DMONEY", "WAAFI"], "opérateur");
+  const walletId = entierOuNull(args.walletId, "wallet", 1);
+  await transaction(async (b) => {
+    await b.exec("UPDATE wallets SET passerelle = NULL WHERE passerelle = ?", [operateur]);
+    if (walletId != null) {
+      const w = await b.ligne(
+        "SELECT id, nom, type_compte, compte_reception FROM wallets WHERE id = ? FOR UPDATE",
+        [walletId]
+      );
+      if (!w) throw new Erreur("Wallet introuvable.");
+      if (w.type_compte !== "NUMERO" || !w.compte_reception) {
+        throw new Erreur("Le wallet " + w.nom + " doit avoir un numéro de réception (celui du téléphone passerelle).");
+      }
+      await b.exec("UPDATE wallets SET passerelle = ?, date_maj = ? WHERE id = ?", [operateur, Date.now(), walletId]);
+      await actualiserSoldes(b, [operateur]);
+      await journaliser(b, acteur.id, "PASSERELLE_WALLET", nomOperateur(operateur) + " lu par la passerelle : wallet " + w.nom);
+    } else {
+      await journaliser(b, acteur.id, "PASSERELLE_WALLET", nomOperateur(operateur) + " n’est plus lu par la passerelle");
+    }
+  });
+}
+async function ordreEssai(acteur, args) {
+  exigerRole(acteur, ["SUPER_ADMIN"]);
+  const operateur = parmi(args.operateur, ["DMONEY", "WAAFI"], "opérateur");
+  const type = parmi(args.type, ["SOLDE", "HISTORIQUE"], "type");
+  await transaction(async (b) => {
+    if (await b.ligne(
+      "SELECT id FROM ordres_passerelle WHERE statut IN ('A_FAIRE', 'EN_COURS') AND demande_id IS NULL AND type = ? AND operateur = ? LIMIT 1",
+      [type, operateur]
+    )) {
+      throw new Erreur("Une lecture identique attend déjà le téléphone.");
+    }
+    await creerOrdre(b, type, operateur, null, "MANUEL");
+  });
+}
+async function reglerExpediteurs(acteur, args) {
+  exigerRole(acteur, ["SUPER_ADMIN"]);
+  const operateur = parmi(args.operateur, ["DMONEY", "WAAFI"], "opérateur");
+  const liste = texte(args.expediteurs, "expéditeurs", 200).split(",").map(normaliserExpediteur).filter((x) => x.length >= 2);
+  if (!liste.length) throw new Erreur("Indiquez au moins un expéditeur (par exemple " + expediteursParDefaut(operateur) + ").");
+  await transaction(async (b) => {
+    await b.exec(
+      "INSERT INTO parametres (cle, valeur, description) VALUES (?, ?, ?) ON CONFLICT (cle) DO UPDATE SET valeur = EXCLUDED.valeur",
+      ["passerelle_expediteurs_" + operateur.toLowerCase(), liste.join(","), "Passerelle : expéditeurs SMS reconnus pour " + nomOperateur(operateur)]
+    );
+    await journaliser(b, acteur.id, "PASSERELLE_EXPEDITEURS", nomOperateur(operateur) + " : expéditeurs reconnus " + liste.join(", "));
+  });
+}
+async function actualiserSoldes(b, operateurs) {
+  for (const o of operateurs) {
+    if (await b.ligne("SELECT id FROM ordres_passerelle WHERE statut IN ('A_FAIRE', 'EN_COURS') AND type = 'SOLDE' AND operateur = ? LIMIT 1", [o])) continue;
+    await creerOrdre(b, "SOLDE", o, null, "ACTUALISATION");
+  }
+}
+
 // src/demandes.ts
-var SELECTION = "SELECT d.id AS id, d.reference AS reference, d.utilisateur_id AS utilisateur_id, d.wallet_source_id AS wallet_source_id, d.wallet_dest_id AS wallet_dest_id, d.numero_source AS numero_source, d.numero_dest AS numero_dest, d.montant AS montant, d.frais AS frais, d.frais_systeme AS frais_systeme, d.montant_net AS montant_net, d.libelle_frais AS libelle_frais, d.mode_source AS mode_source, d.mode_dest AS mode_dest, d.statut AS statut, d.paiement_verifie AS paiement_verifie, d.ref_api_source AS ref_api_source, d.ref_api_dest AS ref_api_dest, d.motif_refus AS motif_refus, d.traite_par AS traite_par, d.date_creation AS date_creation, d.date_confirmation AS date_confirmation, d.date_traitement AS date_traitement, d.nom_beneficiaire AS nom_beneficiaire, d.commission AS commission, d.taux_commission AS taux_commission, ws.nom AS source_nom, wd.nom AS dest_nom, u.nom_complet AS client_nom, u.email AS client_email, a.nom_complet AS admin_nom, (SELECT COUNT(*) FROM preuves_transaction p WHERE p.demande_id = d.id) AS a_preuve, (SELECT COUNT(*) FROM signalements sg WHERE sg.demande_id = d.id AND sg.statut <> 'TRAITE') AS signalement_ouvert FROM demandes_echange d JOIN wallets ws ON ws.id = d.wallet_source_id JOIN wallets wd ON wd.id = d.wallet_dest_id JOIN utilisateurs u ON u.id = d.utilisateur_id LEFT JOIN utilisateurs a ON a.id = d.traite_par ";
+var SELECTION = "SELECT d.id AS id, d.reference AS reference, d.utilisateur_id AS utilisateur_id, d.wallet_source_id AS wallet_source_id, d.wallet_dest_id AS wallet_dest_id, d.numero_source AS numero_source, d.numero_dest AS numero_dest, d.montant AS montant, d.frais AS frais, d.frais_systeme AS frais_systeme, d.montant_net AS montant_net, d.libelle_frais AS libelle_frais, d.mode_source AS mode_source, d.mode_dest AS mode_dest, d.statut AS statut, d.paiement_verifie AS paiement_verifie, d.ref_api_source AS ref_api_source, d.ref_api_dest AS ref_api_dest, d.motif_refus AS motif_refus, d.traite_par AS traite_par, d.date_creation AS date_creation, d.date_confirmation AS date_confirmation, d.date_traitement AS date_traitement, d.nom_beneficiaire AS nom_beneficiaire, d.commission AS commission, d.taux_commission AS taux_commission, d.etape_passerelle AS etape_passerelle, d.motif_blocage AS motif_blocage, d.date_blocage AS date_blocage, ws.nom AS source_nom, wd.nom AS dest_nom, u.nom_complet AS client_nom, u.email AS client_email, a.nom_complet AS admin_nom, (SELECT COUNT(*) FROM preuves_transaction p WHERE p.demande_id = d.id) AS a_preuve, (SELECT COUNT(*) FROM signalements sg WHERE sg.demande_id = d.id AND sg.statut <> 'TRAITE') AS signalement_ouvert FROM demandes_echange d JOIN wallets ws ON ws.id = d.wallet_source_id JOIN wallets wd ON wd.id = d.wallet_dest_id JOIN utilisateurs u ON u.id = d.utilisateur_id LEFT JOIN utilisateurs a ON a.id = d.traite_par ";
 var STATUTS = ["EN_ATTENTE", "EN_COURS", "TRAITEE", "ANNULEE", "REFUSEE"];
+var ETAPES = ["VERIF_PAIEMENT", "ATTENTE_ACCORD", "ENVOI", "BLOQUEE"];
+function pourActeur(acteur, d) {
+  if (d && !estAdmin(acteur)) d.motif_blocage = null;
+  return d;
+}
 async function listerDemandes(acteur, brut, b = base()) {
   const f = brut == null ? {} : objet(brut, "filtre");
   const conditions = [];
@@ -1584,6 +2661,12 @@ async function listerDemandes(acteur, brut, b = base()) {
     conditions.push("d.statut IN (" + marques(statuts.length) + ")");
     statuts.forEach((s2) => args.push(s2));
   }
+  const etapes = tableau(f.etapes, "étapes", 4).map((s2) => parmi(s2, ETAPES, "étape"));
+  if (etapes.length) {
+    conditions.push("d.etape_passerelle IN (" + marques(etapes.length) + ")");
+    etapes.forEach((s2) => args.push(s2));
+  }
+  if (f.horsEtapes === true) conditions.push("(d.etape_passerelle IS NULL OR d.etape_passerelle NOT IN ('ATTENTE_ACCORD', 'BLOQUEE'))");
   const col = f.colonneDate === "date_traitement" ? "d.date_traitement" : "d.date_creation";
   const debut = entierOuNull(f.debut, "début de période", 0);
   const fin = entierOuNull(f.fin, "fin de période", 0);
@@ -1611,7 +2694,8 @@ async function listerDemandes(acteur, brut, b = base()) {
   const ordre = f.colonneDate === "date_traitement" ? "d.date_traitement DESC, d.id DESC" : "d.id DESC";
   const limite = Math.max(1, Math.min(2e3, Math.floor(entierOuNull(f.limite, "limite", 1, 1e5) || 300)));
   args.push(limite);
-  return b.lignes(SELECTION + (conditions.length ? "WHERE " + conditions.join(" AND ") + " " : "") + "ORDER BY " + ordre + " LIMIT ?", args);
+  const lignes = await b.lignes(SELECTION + (conditions.length ? "WHERE " + conditions.join(" AND ") + " " : "") + "ORDER BY " + ordre + " LIMIT ?", args);
+  return lignes.map((d) => pourActeur(acteur, d));
 }
 async function demandeParId(b, id) {
   return b.ligne(SELECTION + "WHERE d.id = ?", [id]);
@@ -1625,7 +2709,7 @@ async function lireDemande(acteur, args) {
   const id = entier(args.id, "demande", 1);
   const d = await demandeParId(base(), id);
   if (!d || !estAdmin(acteur) && d.utilisateur_id !== acteur.id) return null;
-  return d;
+  return pourActeur(acteur, d);
 }
 async function preuveDe(acteur, args) {
   const id = entier(args.id, "demande", 1);
@@ -1637,7 +2721,7 @@ async function compteursClient(acteur, args) {
   exigerRole(acteur, ["UTILISATEUR"]);
   const debutMois = entier(args.debutMois, "début du mois", 0);
   const l = await base().ligne(
-    "SELECT COALESCE(SUM(CASE WHEN statut = 'EN_ATTENTE' THEN 1 ELSE 0 END), 0) AS en_attente, COALESCE(SUM(CASE WHEN statut = 'EN_COURS' THEN 1 ELSE 0 END), 0) AS en_cours, COALESCE(SUM(CASE WHEN statut = 'TRAITEE' THEN 1 ELSE 0 END), 0) AS traitees, COALESCE(SUM(CASE WHEN statut = 'TRAITEE' AND date_traitement >= ? THEN 1 ELSE 0 END), 0) AS nb_mois, COALESCE(SUM(CASE WHEN statut = 'TRAITEE' AND date_traitement >= ? THEN montant ELSE 0 END), 0) AS volume_mois FROM demandes_echange WHERE utilisateur_id = ?",
+    "SELECT COALESCE(SUM(CASE WHEN statut = 'EN_ATTENTE' THEN 1 ELSE 0 END), 0) AS en_attente, COALESCE(SUM(CASE WHEN statut = 'EN_COURS' THEN 1 ELSE 0 END), 0) AS en_cours, COALESCE(SUM(CASE WHEN statut = 'TRAITEE' THEN 1 ELSE 0 END), 0) AS traitees, COALESCE(SUM(CASE WHEN statut = 'TRAITEE' AND date_traitement >= ? THEN 1 ELSE 0 END), 0) AS nb_mois, COALESCE(SUM(CASE WHEN statut = 'TRAITEE' AND date_traitement >= ? THEN montant ELSE 0 END), 0) AS volume_mois, COALESCE(SUM(CASE WHEN statut = 'EN_COURS' AND etape_passerelle = 'BLOQUEE' THEN 1 ELSE 0 END), 0) AS bloquees FROM demandes_echange WHERE utilisateur_id = ?",
     [debutMois, debutMois, acteur.id]
   );
   return {
@@ -1645,7 +2729,8 @@ async function compteursClient(acteur, args) {
     enCours: l ? l.en_cours : 0,
     traitees: l ? l.traitees : 0,
     nbMois: l ? l.nb_mois : 0,
-    volumeMois: l ? l.volume_mois : 0
+    volumeMois: l ? l.volume_mois : 0,
+    bloquees: l ? l.bloquees : 0
   };
 }
 async function numerosRecents(acteur, args) {
@@ -1663,9 +2748,9 @@ async function numerosRecents(acteur, args) {
 async function compteursAdmin(acteur) {
   exigerRole(acteur, ["ADMIN", "SUPER_ADMIN"]);
   const l = await base().ligne(
-    "SELECT COALESCE(SUM(CASE WHEN statut = 'EN_ATTENTE' THEN 1 ELSE 0 END), 0) AS en_attente, COALESCE(SUM(CASE WHEN statut = 'EN_COURS' THEN 1 ELSE 0 END), 0) AS en_cours FROM demandes_echange"
+    "SELECT COALESCE(SUM(CASE WHEN statut = 'EN_ATTENTE' THEN 1 ELSE 0 END), 0) AS en_attente, COALESCE(SUM(CASE WHEN statut = 'EN_COURS' THEN 1 ELSE 0 END), 0) AS en_cours, COALESCE(SUM(CASE WHEN statut = 'EN_COURS' AND etape_passerelle = 'BLOQUEE' THEN 1 ELSE 0 END), 0) AS bloquees, COALESCE(SUM(CASE WHEN statut = 'EN_COURS' AND etape_passerelle = 'ATTENTE_ACCORD' THEN 1 ELSE 0 END), 0) AS accords FROM demandes_echange"
   );
-  return { enAttente: l ? l.en_attente : 0, enCours: l ? l.en_cours : 0 };
+  return { enAttente: l ? l.en_attente : 0, enCours: l ? l.en_cours : 0, bloquees: l ? l.bloquees : 0, accords: l ? l.accords : 0 };
 }
 function controlerNomBeneficiaire(saisie) {
   const nom = (saisie || "").replace(/\s+/g, " ").trim();
@@ -1719,8 +2804,14 @@ async function creerDemande(acteur, args) {
   if (!isFinite(montant) || montant <= 0) throw new Erreur("Saisissez le montant à envoyer.");
   if (montant < p.montantMin) throw new Erreur("Le montant minimum est de " + fdj(p.montantMin) + ".");
   if (montant > p.montantMax) throw new Erreur("Le montant maximum est de " + fdj(p.montantMax) + ".");
-  const c = calculerFrais(montant, dest, p.grille);
+  const c = calculerFraisEchange(montant, source, dest, p.grille, p.passerelleSansFrais === 1);
   if (c.net <= 0) throw new Erreur("Le montant est trop faible par rapport aux frais.");
+  if (dest.passerelle && dest.mode_echange === "AUTOMATIQUE") {
+    const promis = Number(await b.valeur("SELECT COALESCE(SUM(montant_net), 0) AS s FROM demandes_echange WHERE wallet_dest_id = ? AND statut = 'EN_COURS' AND etape_passerelle IN ('VERIF_PAIEMENT', 'ATTENTE_ACCORD', 'ENVOI')", [dest.id]));
+    if (dest.solde_api - promis < c.net) {
+      throw new Erreur("Le wallet " + dest.nom + " n’a pas assez de fonds pour cet échange pour le moment. Réessayez plus tard ou choisissez un montant plus petit.");
+    }
+  }
   let nomBeneficiaire = null;
   if (dest.mode_echange === "MANUEL") {
     const controle = controlerNomBeneficiaire(texte(s2.nomBeneficiaire, "nom du bénéficiaire", 200));
@@ -1777,7 +2868,8 @@ async function annulerDemande(acteur, args) {
 async function confirmerDemande(acteur, args) {
   exigerRole(acteur, ["UTILISATEUR"]);
   const id = entier(args.id, "demande", 1);
-  return transaction(async (tx) => {
+  let parPasserelle = false;
+  const resultat = await transaction(async (tx) => {
     const d = await demandeDuClientVerrouillee(tx, acteur, id);
     if (d.statut !== "EN_ATTENTE") throw new Erreur("Cette demande a déjà été confirmée ou annulée.");
     const source = await walletParId(tx, d.wallet_source_id);
@@ -1789,6 +2881,15 @@ async function confirmerDemande(acteur, args) {
     const modeDest = dest.mode_echange;
     const t = Date.now();
     const majDemande = (sql, valeurs) => tx.exiger(sql, valeurs, "Cette demande a déjà été confirmée ou annulée.");
+    if (modeSource === "AUTOMATIQUE" && source.passerelle) {
+      await majDemande(
+        "UPDATE demandes_echange SET statut = 'EN_COURS', mode_source = ?, mode_dest = ?, date_confirmation = ? WHERE id = ? AND statut = 'EN_ATTENTE'",
+        [modeSource, modeDest, t, id]
+      );
+      await commencerVerification(tx, id);
+      parPasserelle = true;
+      return { statut: "EN_COURS" };
+    }
     if (modeSource !== "AUTOMATIQUE") {
       await majDemande(
         "UPDATE demandes_echange SET statut = 'EN_COURS', mode_source = ?, mode_dest = ?, date_confirmation = ? WHERE id = ? AND statut = 'EN_ATTENTE'",
@@ -1806,6 +2907,13 @@ async function confirmerDemande(acteur, args) {
     const apiSource = await walletPourApi(tx, source.id);
     const verif = await verifierReception(apiSource, d.numero_source, d.montant, d.reference);
     if (!verif.ok) throw new Erreur(verif.message || "Le paiement n’a pas encore été reçu. Réessayez dans un instant.");
+    if (modeDest === "AUTOMATIQUE" && dest.passerelle) {
+      await majDemande("UPDATE demandes_echange SET statut = 'EN_COURS', mode_source = ?, mode_dest = ?, paiement_verifie = 1, ref_api_source = ?, date_confirmation = ? WHERE id = ? AND statut = 'EN_ATTENTE'", [modeSource, modeDest, verif.ref, t, id]);
+      await tx.exec("UPDATE wallets SET solde_api = solde_api + ? WHERE id = ?", [d.montant, source.id]);
+      await envoyerApresApi(tx, id, verif.ref);
+      parPasserelle = true;
+      return { statut: "EN_COURS" };
+    }
     if (modeDest !== "AUTOMATIQUE") {
       await majDemande("UPDATE demandes_echange SET statut = 'EN_COURS', mode_source = ?, mode_dest = ?, paiement_verifie = 1, ref_api_source = ?, date_confirmation = ? WHERE id = ? AND statut = 'EN_ATTENTE'", [modeSource, modeDest, verif.ref, t, id]);
       await tx.exec("UPDATE wallets SET solde_api = solde_api + ? WHERE id = ?", [d.montant, source.id]);
@@ -1851,12 +2959,17 @@ async function confirmerDemande(acteur, args) {
     await alerterSolde(tx, dest, avant, apres);
     return { statut: "TRAITEE" };
   });
+  if (parPasserelle) declencher();
+  return resultat;
 }
 var CAPTURE_MAX_BASE64 = 14e5;
 async function confirmerParAdmin(acteur, args) {
   exigerRole(acteur, ["ADMIN", "SUPER_ADMIN"]);
   const id = entier(args.id, "demande", 1);
   const capture = image(args.capture, "capture", CAPTURE_MAX_BASE64);
+  const refSaisie = texte(args.refOperateur, "identifiant de la transaction", 40).replace(/\s+/g, "");
+  if (refSaisie && !/^[A-Za-z0-9-]{4,30}$/.test(refSaisie)) throw new Erreur("L’identifiant de la transaction est invalide.");
+  let envoiAutomatique = false;
   await transaction(async (tx) => {
     if (!await tx.ligne("SELECT id FROM demandes_echange WHERE id = ? FOR UPDATE", [id])) throw new Erreur("Demande introuvable.");
     const d = await demandeParId(tx, id);
@@ -1864,8 +2977,18 @@ async function confirmerParAdmin(acteur, args) {
     const dest = await walletParId(tx, d.wallet_dest_id);
     if (!dest) throw new Erreur("Wallet destinataire introuvable.");
     const t = Date.now();
-    let refDest = null;
-    if (d.mode_dest === "MANUEL") {
+    let refDest = refSaisie || null;
+    const manuelPasserelle = !!d.etape_passerelle;
+    if (manuelPasserelle) {
+      await preparerDecisionManuelle(tx, id);
+    } else if (d.mode_dest !== "MANUEL" && dest.passerelle) {
+      await envoyerApresAttestation(tx, id);
+      await journaliser(tx, acteur.id, "CONFIRMATION_DEMANDE", "Paiement de la demande " + d.reference + " attesté : envoi de " + fdj(d.montant_net) + " confié à la passerelle (" + d.dest_nom + ")");
+      envoiAutomatique = true;
+      return;
+    }
+    if (manuelPasserelle) {
+    } else if (d.mode_dest === "MANUEL") {
       if (!capture) throw new Erreur("Ajoutez la capture de votre transaction : elle est obligatoire pour confirmer.");
     } else {
       const apiDest = await walletPourApi(tx, dest.id);
@@ -1899,9 +3022,11 @@ async function confirmerParAdmin(acteur, args) {
       tx,
       acteur.id,
       "CONFIRMATION_DEMANDE",
-      "Demande " + d.reference + " confirmée : " + d.source_nom + " → " + d.dest_nom + ", " + fdj(d.montant)
+      "Demande " + d.reference + " confirmée : " + d.source_nom + " → " + d.dest_nom + ", " + fdj(d.montant) + (manuelPasserelle ? " (terminée à la main" + (refDest ? ", ID " + refDest : "") + ")" : "")
     );
   });
+  if (envoiAutomatique) declencher();
+  return { envoiAutomatique };
 }
 async function refuserParAdmin(acteur, args) {
   exigerRole(acteur, ["ADMIN", "SUPER_ADMIN"]);
@@ -1912,6 +3037,7 @@ async function refuserParAdmin(acteur, args) {
     if (!await tx.ligne("SELECT id FROM demandes_echange WHERE id = ? FOR UPDATE", [id])) throw new Erreur("Demande introuvable.");
     const d = await demandeParId(tx, id);
     if (d.statut !== "EN_COURS" && d.statut !== "EN_ATTENTE") throw new Erreur("Cette demande ne peut plus être refusée.");
+    if (d.etape_passerelle) await preparerDecisionManuelle(tx, id);
     await tx.exiger("UPDATE demandes_echange SET statut = 'REFUSEE', motif_refus = ?, traite_par = ?, date_traitement = ? WHERE id = ? AND statut IN ('EN_COURS', 'EN_ATTENTE')", [motif, acteur.id, Date.now(), id], "Cette demande ne peut plus être refusée.");
     await notifier(tx, d.utilisateur_id, "ECHANGE_REFUSE", "Demande refusée", "Votre demande " + d.reference + " a été refusée. Motif : " + motif, id);
     await journaliser(tx, acteur.id, "REFUS_DEMANDE", "Demande " + d.reference + " refusée : " + motif);
@@ -1990,6 +3116,7 @@ async function effacerDonneesEchanges(acteur) {
   exigerRole(acteur, ["SUPER_ADMIN"]);
   exigerModeTest();
   await transaction(async (tx) => {
+    await tx.exec("DELETE FROM ordres_passerelle");
     await tx.exec("DELETE FROM signalements");
     await tx.exec("DELETE FROM preuves_transaction");
     await tx.exec("DELETE FROM notifications");
@@ -2257,7 +3384,7 @@ var OPERATIONS = {
   "wallets.modifier": { acces: "super", executer: (args, ctx) => majWallet(a(ctx), args) },
   "wallets.supprimer": { acces: "super", executer: (args, ctx) => supprimerWallet(a(ctx), args) },
   "wallets.definirModes": { acces: "super", executer: (args, ctx) => definirModes(a(ctx), args) },
-  "wallets.actualiserSoldes": { acces: "admin", executer: (args, ctx) => actualiserSoldes(a(ctx)) },
+  "wallets.actualiserSoldes": { acces: "admin", executer: (args, ctx) => actualiserSoldes2(a(ctx)) },
   "wallets.soldeSimule": { acces: "super", executer: (args, ctx) => definirSoldeSimule(a(ctx), args) },
   // --- demandes d'échange
   "demandes.lister": { acces: "connecte", executer: (args, ctx) => listerDemandes(a(ctx), args.filtre) },
@@ -2271,6 +3398,20 @@ var OPERATIONS = {
   "demandes.compteursAdmin": { acces: "admin", executer: (args, ctx) => compteursAdmin(a(ctx)) },
   "demandes.confirmerParAdmin": { acces: "admin", executer: (args, ctx) => confirmerParAdmin(a(ctx), args) },
   "demandes.refuser": { acces: "admin", executer: (args, ctx) => refuserParAdmin(a(ctx), args) },
+  "demandes.autoriserEnvoi": { acces: "admin", executer: (args, ctx) => autoriserEnvoi(a(ctx), args) },
+  "demandes.validerPaiement": { acces: "admin", executer: (args, ctx) => validerPaiement(a(ctx), args) },
+  // --- téléphone passerelle (test D-Money / Waafi)
+  "passerelle.associer": { acces: "public", limite: "code", executer: (args) => associer(args) },
+  "passerelle.synchroniser": {
+    acces: "passerelle",
+    executer: (args, ctx) => synchroniser(ctx.passerelle.id, args)
+  },
+  "passerelle.etat": { acces: "super", executer: (args, ctx) => etat(a(ctx)) },
+  "passerelle.creerCode": { acces: "super", executer: (args, ctx) => creerCode(a(ctx)) },
+  "passerelle.dissocier": { acces: "super", executer: (args, ctx) => dissocier(a(ctx)) },
+  "passerelle.affecterWallet": { acces: "super", executer: (args, ctx) => affecterWallet(a(ctx), args) },
+  "passerelle.ordreEssai": { acces: "super", executer: (args, ctx) => ordreEssai(a(ctx), args) },
+  "passerelle.reglerExpediteurs": { acces: "super", executer: (args, ctx) => reglerExpediteurs(a(ctx), args) },
   // --- signalements
   "signalements.lister": { acces: "connecte", executer: (args, ctx) => listerSignalements(a(ctx), args.filtre) },
   "signalements.lire": { acces: "connecte", executer: (args, ctx) => lireSignalement(a(ctx), args) },
@@ -2298,7 +3439,9 @@ async function executerOperation(nom, args, ctx) {
   const op = Object.prototype.hasOwnProperty.call(OPERATIONS, nom) ? OPERATIONS[nom] : null;
   if (!op) throw new ErreurHttp(404, "INCONNUE", "Opération inconnue.");
   if (op.limite) limiter(op.limite, ctx.ip);
-  if (op.acces !== "public") {
+  if (op.acces === "passerelle") {
+    if (!ctx.passerelle) throw new ErreurHttp(401, "PASSERELLE", "Téléphone passerelle non associé. Associez-le de nouveau depuis l’écran Passerelle.");
+  } else if (op.acces !== "public") {
     if (!ctx.acteur || !ctx.session) throw new ErreurHttp(401, "SESSION", ctx.refusSession || "Connectez-vous pour continuer.");
     if (ctx.session.doitChanger && !op.restreint) {
       throw new ErreurHttp(403, "MDP_A_CHANGER", "Choisissez d’abord votre nouveau mot de passe.");
@@ -2358,6 +3501,11 @@ function jetonDe(req) {
   const m = /^Bearer\s+([0-9a-f]{64})$/i.exec(h.trim());
   return m ? m[1].toLowerCase() : null;
 }
+function jetonPasserelleDe(req) {
+  const h = req.headers.authorization || "";
+  const m = /^Passerelle\s+([0-9a-f]{64})$/i.exec(h.trim());
+  return m ? m[1].toLowerCase() : null;
+}
 async function sante(res) {
   let baseOk = false;
   try {
@@ -2393,9 +3541,12 @@ async function api(req, res, nom) {
       throw new ErreurHttp(400, "JSON", "Requête illisible.");
     }
     if (!args || typeof args !== "object" || Array.isArray(args)) throw new ErreurHttp(400, "JSON", "Requête illisible.");
-    const ctx = { acteur: null, session: null, refusSession: null, ip };
+    const ctx = { acteur: null, session: null, refusSession: null, ip, passerelle: null };
     const jeton = jetonDe(req);
-    if (jeton) {
+    const jetonPasserelle = jetonPasserelleDe(req);
+    if (jetonPasserelle) {
+      ctx.passerelle = await passerelleParJeton(jetonPasserelle);
+    } else if (jeton) {
       const s2 = await lireSession(jeton);
       if ("refus" in s2) {
         ctx.refusSession = s2.refus;
@@ -2486,6 +3637,9 @@ function demarrer() {
   setInterval(() => {
     if (pret) nettoyerExpirees().catch((e) => console.error("[base] nettoyage :", e && e.message));
   }, 60 * 60 * 1e3).unref();
+  setInterval(() => {
+    if (pret) avancer().catch((e) => console.error("[passerelle] avancement :", e && e.message));
+  }, 30 * 1e3).unref();
   const arreter = () => {
     serveur.close(() => {
       fermerPool().finally(() => process.exit(0));

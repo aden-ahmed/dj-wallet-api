@@ -1,6 +1,6 @@
 {
   "name": "dj-wallet-api",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "private": true,
   "description": "Serveur API de Dj Wallet Exchange (Render) relié à la base PostgreSQL Supabase.",
   "main": "server.js",
