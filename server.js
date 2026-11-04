@@ -3871,18 +3871,22 @@ async function confirmerDemande(acteur, args) {
       parPasserelle = true;
       return { statut: "EN_COURS" };
     }
-    if (modeSource !== "AUTOMATIQUE") {
+    const sourceSimulee = config.modeTest && modeSource === "AUTOMATIQUE" && !source.passerelle && modeDest === "AUTOMATIQUE" && !!dest.passerelle;
+    if (modeSource !== "AUTOMATIQUE" || sourceSimulee) {
       await majDemande(
         "UPDATE demandes_echange SET statut = 'EN_COURS', mode_source = ?, mode_dest = ?, date_confirmation = ? WHERE id = ? AND statut = 'EN_ATTENTE'",
-        [modeSource, modeDest, t, id]
+        [sourceSimulee ? "MANUEL" : modeSource, modeDest, t, id]
       );
       await notifierAdmins(
         tx,
         "DEMANDE_A_TRAITER",
         "Nouvelle demande à vérifier",
-        d.client_nom + " : " + d.source_nom + " → " + d.dest_nom + ", " + fdj(d.montant) + ". Paiement à vérifier manuellement.",
+        d.client_nom + " : " + d.source_nom + " → " + d.dest_nom + ", " + fdj(d.montant) + (sourceSimulee ? ". Mode test : l’API " + d.source_nom + " est simulée, le paiement n’est pas prouvé. Vérifiez sa réception sur votre compte " + d.source_nom + " avant de confirmer : la passerelle enverra de l’argent réel." : ". Paiement à vérifier manuellement."),
         id
       );
+      if (sourceSimulee) {
+        await journaliser(tx, null, "PAIEMENT_SIMULE", "Demande " + d.reference + " : API " + d.source_nom + " simulée (mode test) et envoi réel par la passerelle (" + d.dest_nom + ") : paiement à vérifier par un administrateur");
+      }
       return { statut: "EN_COURS" };
     }
     const apiSource = await walletPourApi(tx, source.id);
