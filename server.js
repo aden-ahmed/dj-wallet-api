@@ -1,4 +1,4 @@
-// Dj Wallet Exchange — serveur API 1.3.0 (fichier construit par serveur/build.mjs à partir de serveur/src :
+// Dj Wallet Exchange — serveur API 1.4.0 (fichier construit par serveur/build.mjs à partir de serveur/src :
 // ne pas modifier à la main). Déposer ce fichier et package.json sur GitHub ; Render installe « pg » et lance « node server.js ».
 "use strict";
 var __create = Object.create;
@@ -37,6 +37,9 @@ __export(main_exports, {
 });
 module.exports = __toCommonJS(main_exports);
 var http = __toESM(require("http"));
+
+// src/auth.ts
+var crypto2 = __toESM(require("crypto"));
 
 // ../web/src/domain.ts
 var MOTIFS_SIGNALEMENT = [
@@ -203,8 +206,8 @@ var Erreur = class extends Error {
 var import_pg = require("pg");
 
 // src/config.ts
-var VERSION = "1.3.0";
-var VERSION_SCHEMA = 4;
+var VERSION = "1.4.0";
+var VERSION_SCHEMA = 6;
 function drapeau(nom, defaut) {
   const v = (process.env[nom] || "").trim().toLowerCase();
   if (!v) return defaut;
@@ -464,6 +467,7 @@ function exigerRole(acteur, roles) {
 function estAdmin(u) {
   return !!u && (u.role === "ADMIN" || u.role === "SUPER_ADMIN");
 }
+var TEXTES = ["contactSupport", "messageSuspension"];
 var GRILLE_DEFAUT = {
   tranches: [{ max: 1e3, type: "FIXE", valeur: 10 }, { max: null, type: "POURCENTAGE", valeur: 1 }]
 };
@@ -478,7 +482,16 @@ var DEFAUTS = {
   passerelleMontantAuto: 500,
   passerelleDelaiSecondes: 120,
   passerelleSansFrais: 1,
-  passerelleDelaiPaiementMinutes: 10
+  passerelleDelaiPaiementMinutes: 2,
+  passerelleAttenteMessageSecondes: 15,
+  passerelleDelaiInterventionMinutes: 3,
+  sessionClientMinutes: 2,
+  sessionAdminMinutes: 5,
+  limiteEnvoiJour: 1e5,
+  alerteEnvoiJour: 5e4,
+  limiteGlobaleJour: 0,
+  serviceSuspendu: 0,
+  messageSuspension: ""
 };
 var CLES = {
   montantMin: "montant_min",
@@ -491,7 +504,16 @@ var CLES = {
   passerelleMontantAuto: "passerelle_montant_auto",
   passerelleDelaiSecondes: "passerelle_delai_secondes",
   passerelleSansFrais: "passerelle_sans_frais",
-  passerelleDelaiPaiementMinutes: "passerelle_delai_paiement_minutes"
+  passerelleDelaiPaiementMinutes: "passerelle_delai_paiement_minutes",
+  passerelleAttenteMessageSecondes: "passerelle_attente_message_secondes",
+  passerelleDelaiInterventionMinutes: "passerelle_delai_intervention_minutes",
+  sessionClientMinutes: "session_client_minutes",
+  sessionAdminMinutes: "session_admin_minutes",
+  limiteEnvoiJour: "limite_envoi_jour",
+  alerteEnvoiJour: "alerte_envoi_jour",
+  limiteGlobaleJour: "limite_globale_jour",
+  serviceSuspendu: "service_suspendu",
+  messageSuspension: "message_suspension"
 };
 var BORNES = {
   montantMin: [1, 1e9],
@@ -503,7 +525,15 @@ var BORNES = {
   passerelleMontantAuto: [0, 1e9],
   passerelleDelaiSecondes: [0, 86400],
   passerelleSansFrais: [0, 1],
-  passerelleDelaiPaiementMinutes: [3, 120]
+  passerelleDelaiPaiementMinutes: [1, 120],
+  passerelleAttenteMessageSecondes: [5, 120],
+  passerelleDelaiInterventionMinutes: [1, 60],
+  sessionClientMinutes: [1, 30],
+  sessionAdminMinutes: [1, 30],
+  limiteEnvoiJour: [0, 1e9],
+  alerteEnvoiJour: [0, 1e9],
+  limiteGlobaleJour: [0, 1e11],
+  serviceSuspendu: [0, 1]
 };
 var cache = null;
 var DUREE_CACHE = 30 * 1e3;
@@ -521,7 +551,7 @@ async function chargerParametres(b = base(), forcer = false) {
   const p = { grille: await chargerGrille(b) };
   Object.keys(CLES).forEach((nom) => {
     const valeur = brut[CLES[nom]];
-    if (nom === "contactSupport") {
+    if (TEXTES.indexOf(nom) >= 0) {
       p[nom] = valeur == null ? DEFAUTS[nom] : valeur;
     } else {
       const n = valeur == null ? NaN : Number(valeur);
@@ -560,6 +590,8 @@ async function enregistrerParametres(acteur, modifsBrutes) {
       modifs.grille = lireGrille(brutes.grille);
     } else if (cle === "contactSupport") {
       modifs.contactSupport = texte(brutes.contactSupport, "contact du support", 200).trim();
+    } else if (cle === "serviceSuspendu" || cle === "messageSuspension") {
+      throw new Erreur("La suspension du service se règle avec « Suspendre les nouvelles demandes ».");
     } else if (cle in BORNES) {
       const k = cle;
       modifs[k] = entier(brutes[k], cle, BORNES[k][0], BORNES[k][1]);
@@ -574,6 +606,9 @@ async function enregistrerParametres(acteur, modifsBrutes) {
   }
   const erreur = erreurGrille(p.grille, p.montantMin);
   if (erreur) throw new Erreur(erreur);
+  if (p.limiteEnvoiJour > 0 && p.alerteEnvoiJour > p.limiteEnvoiJour) {
+    throw new Erreur("Le seuil d’alerte doit être inférieur ou égal à la limite d’envoi par jour.");
+  }
   const t = Date.now();
   await transaction(async (tx) => {
     if (modifs.grille) {
@@ -589,7 +624,20 @@ async function enregistrerParametres(acteur, modifsBrutes) {
         [CLES[nom], String(p[nom])]
       );
     }
-    await journaliser(tx, acteur.id, "PARAMETRES", "Frais : " + descriptionGrille(p.grille) + " ; montants de " + nombre(p.montantMin) + " à " + fdj(p.montantMax) + " ; passerelle : " + fdj(p.passerelleMontantAuto) + " sans accord, " + p.passerelleDelaiSecondes + " s entre deux demandes, " + (p.passerelleSansFrais ? "sans frais" : "frais habituels") + ", refus sans paiement après " + p.passerelleDelaiPaiementMinutes + " min");
+    await journaliser(tx, acteur.id, "PARAMETRES", "Frais : " + descriptionGrille(p.grille) + " ; montants de " + nombre(p.montantMin) + " à " + fdj(p.montantMax) + " ; passerelle : " + fdj(p.passerelleMontantAuto) + " sans accord, " + p.passerelleDelaiSecondes + " s entre deux demandes, " + (p.passerelleSansFrais ? "sans frais" : "frais habituels") + ", solde lu après " + p.passerelleAttenteMessageSecondes + " s sans message, refus sans paiement après " + p.passerelleDelaiPaiementMinutes + " min, intervention annoncée au client après " + p.passerelleDelaiInterventionMinutes + " min ; déconnexion : clients " + p.sessionClientMinutes + " min, administrateurs " + p.sessionAdminMinutes + " min par défaut ; envois du service par jour : limite par compte et par numéro " + (p.limiteEnvoiJour ? fdj(p.limiteEnvoiJour) : "aucune") + ", alerte " + (p.alerteEnvoiJour ? fdj(p.alerteEnvoiJour) : "aucune") + ", limite totale " + (p.limiteGlobaleJour ? fdj(p.limiteGlobaleJour) : "aucune"));
+  });
+  invaliderParametres();
+}
+async function suspendreService(acteur, args) {
+  exigerRole(acteur, ["SUPER_ADMIN"]);
+  const suspendu = args.suspendu === true || args.suspendu === 1;
+  const message = suspendu ? texte(args.message == null ? "" : args.message, "message", 200).replace(/\s+/g, " ").trim() : "";
+  await transaction(async (tx) => {
+    for (const [cle, valeur] of [["service_suspendu", suspendu ? "1" : "0"], ["message_suspension", message]]) {
+      await tx.exec("INSERT INTO parametres (cle, valeur) VALUES (?, ?) ON CONFLICT (cle) DO UPDATE SET valeur = EXCLUDED.valeur", [cle, valeur]);
+    }
+    await journaliser(tx, acteur.id, suspendu ? "SERVICE_SUSPENDU" : "SERVICE_RETABLI", suspendu ? "Service d’échange suspendu : aucune nouvelle demande" + (message ? " (« " + message + " »)" : "") : "Service d’échange rétabli");
+    await notifierAdmins(tx, "SERVICE", suspendu ? "Service d’échange suspendu" : "Service d’échange rétabli", suspendu ? acteur.nom_complet + " a suspendu les nouvelles demandes. Les demandes en attente ou en cours continuent d’être traitées." + (message ? " Message aux clients : « " + message + " »" : "") : acteur.nom_complet + " a rétabli le service : les clients peuvent à nouveau créer des demandes.");
   });
   invaliderParametres();
 }
@@ -758,22 +806,38 @@ function dernierEnvoiFictif(cle) {
 var ITERATIONS = 31e4;
 var LONGUEUR_MIN_MOT_DE_PASSE = 8;
 var LONGUEUR_MAX_MOT_DE_PASSE = 128;
-var DUREE_SESSION_COURTE = 12 * 60 * 60 * 1e3;
-var DUREE_SESSION_LONGUE = 30 * 24 * 60 * 60 * 1e3;
+var DUREE_SESSION_MAX = 12 * 60 * 60 * 1e3;
 var DELAI_CHANGEMENT_OBLIGATOIRE = 30 * 60 * 1e3;
 var MAX_ESSAIS_CODE = 5;
 var MAX_ACCES_EMPREINTE = 5;
 var SEL_FACTICE = "6a8f1c0e4b2d7a9531c6e0f2b4d8a7c3";
 var MESSAGE_IDENTIFIANTS = "E-mail ou mot de passe incorrect.";
-var COLONNES_SECRETES = COLONNES_UTILISATEUR + ", mot_de_passe_hash, sel, iterations, tentatives_echouees, verrouille_jusqua, doit_changer_mdp";
+var CHOIX_DECONNEXION = [1, 2, 5, 10, 15, 30];
+var VALIDITE_DEFI = 5 * 60 * 1e3;
+var MESSAGE_APPLI_PARTENAIRE = "Ce compte est un compte administrateur : connectez-vous avec l’application Dj Wallet Exchange Partenaire, sur votre téléphone enregistré.";
+var MESSAGE_APPLI_CLIENT = "Cette application est réservée aux administrateurs. Les clients utilisent l’application Dj Wallet Exchange.";
+var COLONNES_SECRETES = COLONNES_UTILISATEUR + ", mot_de_passe_hash, sel, iterations, tentatives_echouees, verrouille_jusqua, doit_changer_mdp, deconnexion_minutes, verrouillages, dernier_verrouillage";
+function estRoleAdmin(role) {
+  return role === "ADMIN" || role === "SUPER_ADMIN";
+}
+function exigerBonneApplication(role, application) {
+  if (estRoleAdmin(role) && application !== "partenaire") throw new Erreur(MESSAGE_APPLI_PARTENAIRE);
+  if (!estRoleAdmin(role) && application === "partenaire") throw new Erreur(MESSAGE_APPLI_CLIENT);
+}
+async function delaiInactivite(role, choixMinutes) {
+  const p = await chargerParametres();
+  if (!estRoleAdmin(role)) return p.sessionClientMinutes * 6e4;
+  const m = Number(choixMinutes);
+  return (CHOIX_DECONNEXION.indexOf(m) >= 0 ? m : p.sessionAdminMinutes) * 6e4;
+}
 function nettoyerEmail(v) {
   return texte(v, "e-mail", 254).trim().toLowerCase();
 }
 async function ligneParEmail(b, email) {
   return b.ligne("SELECT " + COLONNES_SECRETES + " FROM utilisateurs WHERE lower(email) = lower(?)", [email.trim()]);
 }
-async function ligneParId(b, id, verrouiller = false) {
-  return b.ligne("SELECT " + COLONNES_SECRETES + " FROM utilisateurs WHERE id = ?" + (verrouiller ? " FOR UPDATE" : ""), [id]);
+async function ligneParId(b, id, verrouiller2 = false) {
+  return b.ligne("SELECT " + COLONNES_SECRETES + " FROM utilisateurs WHERE id = ?" + (verrouiller2 ? " FOR UPDATE" : ""), [id]);
 }
 async function utilisateurParId(id) {
   const l = await base().ligne("SELECT " + COLONNES_UTILISATEUR + " FROM utilisateurs WHERE id = ?", [id]);
@@ -801,9 +865,45 @@ async function motDePasseCorrect(l, mdp) {
   const it = Math.max(1e3, Math.min(5e6, Number(l.iterations) || 12e4));
   return egalConstant(await pbkdf2Hex(mdp, l.sel, it), l.mot_de_passe_hash);
 }
+function dureeTexte(ms) {
+  const minutes = Math.max(1, Math.ceil(ms / 6e4));
+  if (minutes < 120) return minutes + " minute" + (minutes > 1 ? "s" : "");
+  const heures = Math.ceil(minutes / 60);
+  return heures + " heure" + (heures > 1 ? "s" : "");
+}
 function messageVerrou(jusqua, t) {
-  const minutes = Math.max(1, Math.ceil((jusqua - t) / 6e4));
-  return "Trop de tentatives. Réessayez dans " + minutes + " minute" + (minutes > 1 ? "s" : "") + ".";
+  return "Trop de tentatives. Réessayez dans " + dureeTexte(jusqua - t) + ".";
+}
+async function verrouiller(l, t, echecs) {
+  const p = await chargerParametres();
+  const recent = l.dernier_verrouillage != null && t - Number(l.dernier_verrouillage) < 24 * 3600 * 1e3;
+  const rang = (recent ? Number(l.verrouillages) || 0 : 0) + 1;
+  const minutes = rang === 1 ? p.connexionVerrouillageMinutes : rang === 2 ? Math.max(30, p.connexionVerrouillageMinutes) : 24 * 60;
+  const jusqua = t + minutes * 6e4;
+  const pose = await transaction(async (tx) => {
+    const n = await tx.exec("UPDATE utilisateurs SET tentatives_echouees = 0, verrouille_jusqua = ?, verrouillages = ?, dernier_verrouillage = ? WHERE id = ? AND (verrouille_jusqua IS NULL OR verrouille_jusqua <= ?)", [jusqua, rang, t, l.id, t]);
+    if (!n) return false;
+    await journaliser(tx, l.id, "VERROUILLAGE", "Compte verrouillé " + dureeTexte(minutes * 6e4) + " après " + echecs + " échecs de connexion" + (rang > 1 ? " (" + rang + "e verrouillage en 24 heures)" : ""));
+    await notifier(
+      tx,
+      l.id,
+      "SECURITE",
+      "Connexion bloquée",
+      "Trop de mots de passe incorrects : votre compte est verrouillé pendant " + dureeTexte(minutes * 6e4) + ". Si ce n’était pas vous, changez votre mot de passe dès votre prochaine connexion."
+    );
+    if (estRoleAdmin(l.role)) {
+      await tx.exec(
+        "INSERT INTO notifications (utilisateur_id, type, titre, message, lu, date_creation) SELECT id, 'SECURITE', ?, ?, 0, ? FROM utilisateurs WHERE role = 'SUPER_ADMIN' AND statut = 'ACTIF' AND id <> ?",
+        ["Compte administrateur verrouillé", l.nom_complet + " (" + l.email + ") : " + echecs + " mots de passe incorrects, compte verrouillé " + dureeTexte(minutes * 6e4) + ".", t, l.id]
+      );
+    }
+    return true;
+  });
+  if (!pose) {
+    const v = Number(await base().valeur("SELECT verrouille_jusqua FROM utilisateurs WHERE id = ?", [l.id])) || jusqua;
+    return messageVerrou(v, t);
+  }
+  return "Trop de tentatives. Votre compte est verrouillé pendant " + dureeTexte(minutes * 6e4) + ".";
 }
 async function verifierAvecTentatives(l, mdp, messageEchec, avecRestant) {
   const p = await chargerParametres();
@@ -817,48 +917,66 @@ async function verifierAvecTentatives(l, mdp, messageEchec, avecRestant) {
     throw new Erreur(messageVerrou(v, t));
   }
   const max = p.connexionMaxTentatives;
-  const verrouJusqua = t + p.connexionVerrouillageMinutes * 6e4;
-  if (r.n > max) {
-    await base().exec("UPDATE utilisateurs SET tentatives_echouees = 0, verrouille_jusqua = ? WHERE id = ?", [verrouJusqua, l.id]);
-    throw new Erreur(messageVerrou(verrouJusqua, t));
-  }
+  if (r.n > max) throw new Erreur(await verrouiller(l, t, r.n));
   if (await motDePasseCorrect(l, mdp)) {
     await base().exec("UPDATE utilisateurs SET tentatives_echouees = 0, verrouille_jusqua = NULL WHERE id = ?", [l.id]);
     return;
   }
-  if (r.n >= max) {
-    await transaction(async (tx) => {
-      await tx.exec("UPDATE utilisateurs SET tentatives_echouees = 0, verrouille_jusqua = ? WHERE id = ?", [verrouJusqua, l.id]);
-      await journaliser(tx, l.id, "VERROUILLAGE", "Compte verrouillé " + p.connexionVerrouillageMinutes + " min après " + r.n + " échecs de connexion");
-    });
-    throw new Erreur("Trop de tentatives. Votre compte est verrouillé pendant " + p.connexionVerrouillageMinutes + " minutes.");
-  }
+  if (r.n >= max) throw new Erreur(await verrouiller(l, t, r.n));
   const restant = max - r.n;
   throw new Erreur(messageEchec + (avecRestant && restant <= 2 ? " Il vous reste " + restant + " tentative" + (restant > 1 ? "s" : "") + "." : ""));
 }
-async function ouvrirSession(b, utilisateurId, seSouvenir) {
+async function ouvrirSession(b, l, application, appareilId) {
   const jeton = aleaHex(32);
   const t = Date.now();
+  const delai = await delaiInactivite(l.role, l.deconnexion_minutes == null ? null : Number(l.deconnexion_minutes));
   await b.exec(
-    "INSERT INTO sessions (utilisateur_id, jeton_hash, se_souvenir, date_creation, date_expiration) VALUES (?, ?, ?, ?, ?)",
-    [utilisateurId, sha256Hex(jeton), seSouvenir ? 1 : 0, t, t + (seSouvenir ? DUREE_SESSION_LONGUE : DUREE_SESSION_COURTE)]
+    "INSERT INTO sessions (utilisateur_id, jeton_hash, se_souvenir, date_creation, date_expiration, application, appareil_id, derniere_activite, delai_inactivite) VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?)",
+    [l.id, sha256Hex(jeton), t, t + DUREE_SESSION_MAX, application, appareilId, t, delai]
   );
   return jeton;
 }
-async function lireSession(jeton) {
+async function lireSession(jeton, ctx = { application: "client", inactivite: null }) {
   if (!jetonValide(jeton)) return { refus: "Votre session a expiré. Reconnectez-vous." };
   const l = await base().ligne(
-    "SELECT s.id AS session_id, s.se_souvenir AS se_souvenir, s.date_creation AS session_creation, s.date_expiration AS date_expiration, u.id AS id, u.nom_complet AS nom_complet, u.email AS email, u.telephone AS telephone, u.role AS role, u.statut AS statut, u.email_verifie AS email_verifie, u.date_creation AS date_creation, u.derniere_connexion AS derniere_connexion, u.doit_changer_mdp AS doit_changer_mdp FROM sessions s JOIN utilisateurs u ON u.id = s.utilisateur_id WHERE s.jeton_hash = ?",
+    "SELECT s.id AS session_id, s.se_souvenir AS se_souvenir, s.date_creation AS session_creation, s.date_expiration AS date_expiration, s.application AS application, s.appareil_id AS appareil_id, s.derniere_activite AS derniere_activite, s.delai_inactivite AS delai_inactivite, a.statut AS appareil_statut, u.id AS id, u.nom_complet AS nom_complet, u.email AS email, u.telephone AS telephone, u.role AS role, u.statut AS statut, u.email_verifie AS email_verifie, u.date_creation AS date_creation, u.derniere_connexion AS derniere_connexion, u.doit_changer_mdp AS doit_changer_mdp, u.deconnexion_minutes AS deconnexion_minutes FROM sessions s JOIN utilisateurs u ON u.id = s.utilisateur_id LEFT JOIN appareils a ON a.id = s.appareil_id WHERE s.jeton_hash = ?",
     [sha256Hex(jeton)]
   );
   if (!l) return { refus: "Votre session a expiré. Reconnectez-vous." };
-  if (l.date_expiration < Date.now() || l.statut !== "ACTIF" || !l.email_verifie) {
-    await base().exec("DELETE FROM sessions WHERE id = ?", [l.session_id]);
-    return { refus: l.statut !== "ACTIF" ? "Votre compte est bloqué. Contactez l’administrateur." : "Votre session a expiré. Reconnectez-vous." };
+  const t = Date.now();
+  const application = l.application === "partenaire" ? "partenaire" : "client";
+  const delai = Number(l.delai_inactivite) || await delaiInactivite(l.role, l.deconnexion_minutes);
+  const derniere = Number(l.derniere_activite) || Number(l.session_creation);
+  const activite = ctx.inactivite == null ? derniere : Math.max(derniere, t - Math.max(0, ctx.inactivite));
+  let refus = null;
+  if (l.statut !== "ACTIF") refus = "Votre compte est bloqué. Contactez l’administrateur.";
+  else if (l.date_expiration < t || !l.email_verifie) refus = "Votre session a expiré. Reconnectez-vous.";
+  else if (t - activite > delai) {
+    refus = "Vous avez été déconnecté après " + dureeTexte(delai) + " sans activité. Reconnectez-vous.";
+  } else if (application !== ctx.application || estRoleAdmin(l.role) !== (application === "partenaire")) {
+    refus = "Votre session a expiré. Reconnectez-vous.";
+  } else if (application === "partenaire" && (l.appareil_id == null || l.appareil_statut !== "APPROUVE")) {
+    refus = "Ce téléphone n’est plus autorisé par le super administrateur. Reconnectez-vous depuis votre téléphone enregistré.";
   }
+  if (refus) {
+    await base().exec("DELETE FROM sessions WHERE id = ?", [l.session_id]);
+    return { refus };
+  }
+  if (activite - derniere > 5e3) await base().exec(
+    "UPDATE sessions SET derniere_activite = ? WHERE id = ? AND COALESCE(derniere_activite, 0) < ?",
+    [activite, l.session_id, activite]
+  );
   return {
     acteur: versUtilisateur(l),
-    session: { id: l.session_id, seSouvenir: !!l.se_souvenir, dateCreation: l.session_creation, doitChanger: !!l.doit_changer_mdp }
+    session: {
+      id: l.session_id,
+      seSouvenir: false,
+      dateCreation: l.session_creation,
+      doitChanger: !!l.doit_changer_mdp,
+      application,
+      appareilId: l.appareil_id == null ? null : Number(l.appareil_id),
+      delaiInactivite: delai
+    }
   };
 }
 async function seDeconnecter(session) {
@@ -868,15 +986,214 @@ async function nettoyerExpirees() {
   const t = Date.now();
   const jour = 24 * 3600 * 1e3;
   await base().exec("DELETE FROM sessions WHERE date_expiration < ?", [t]);
+  await base().exec("DELETE FROM sessions WHERE COALESCE(derniere_activite, date_creation) + COALESCE(delai_inactivite, 3600000) < ?", [t]);
+  await base().exec("DELETE FROM appareils WHERE statut = 'EN_ATTENTE_CODE' AND date_creation < ?", [t - 7 * jour]);
   await base().exec("DELETE FROM codes_verification WHERE date_creation < ?", [t - 7 * jour]);
   await base().exec("DELETE FROM acces_biometriques WHERE COALESCE(derniere_utilisation, date_creation) < ?", [t - 180 * jour]);
 }
-async function seConnecter(args) {
+var SECRET_DEFI = crypto2.randomBytes(32);
+function sceauDefi(corps) {
+  return crypto2.createHmac("sha256", SECRET_DEFI).update(corps, "utf8").digest("hex");
+}
+function creerDefi() {
+  const corps = Date.now() + "." + aleaHex(12);
+  return { defi: corps + "." + sceauDefi(corps) };
+}
+function defiValide(defi) {
+  const m = /^(\d{12,15})\.([0-9a-f]{24})\.([0-9a-f]{64})$/.exec(defi);
+  if (!m) return false;
+  const quand = Number(m[1]);
+  const t = Date.now();
+  if (quand > t + 3e4 || t - quand > VALIDITE_DEFI) return false;
+  return egalConstant(sceauDefi(m[1] + "." + m[2]), m[3]);
+}
+function nomAppareil(v) {
+  const brut = typeof v === "string" ? v : "";
+  const net = brut.split("").filter((c) => c.charCodeAt(0) >= 32 && c !== "<" && c !== ">").join("").replace(/\s+/g, " ").trim();
+  return net.substring(0, 60) || "Téléphone";
+}
+function verifierPreuve(v, usage, email) {
+  const refus = new ErreurHttp(401, "APPAREIL", "Ce téléphone n’a pas pu prouver son identité. Fermez puis rouvrez l’application et réessayez.");
+  const o = v && typeof v === "object" && !Array.isArray(v) ? v : null;
+  if (!o || typeof o.cle !== "string" || typeof o.signature !== "string" || typeof o.defi !== "string") throw refus;
+  if (o.cle.length > 400 || o.signature.length > 200 || !/^[A-Za-z0-9+/=]+$/.test(o.cle) || !/^[A-Za-z0-9+/=]+$/.test(o.signature)) throw refus;
+  if (!defiValide(o.defi)) throw refus;
+  let cle;
+  try {
+    cle = crypto2.createPublicKey({ key: Buffer.from(o.cle, "base64"), format: "der", type: "spki" });
+  } catch (e) {
+    throw refus;
+  }
+  const details = cle.asymmetricKeyDetails || {};
+  if (cle.asymmetricKeyType !== "ec" || details.namedCurve !== "prime256v1") throw refus;
+  const message = "djx|" + usage + "|" + email.toLowerCase() + "|" + o.defi;
+  let ok = false;
+  try {
+    ok = crypto2.verify("sha256", Buffer.from(message, "utf8"), { key: cle, dsaEncoding: "der" }, Buffer.from(o.signature, "base64"));
+  } catch (e) {
+    ok = false;
+  }
+  if (!ok) throw refus;
+  const der = cle.export({ format: "der", type: "spki" }).toString("base64");
+  return { cle: der, empreinte: sha256Hex("djx-appareil|" + der), nom: nomAppareil(o.nom) };
+}
+async function appareilPourConnexion(l, preuve) {
+  const t = Date.now();
+  const a2 = await base().ligne(
+    "SELECT id, utilisateur_id, statut, nom, date_envoi_code FROM appareils WHERE utilisateur_id = ? AND empreinte = ?",
+    [l.id, preuve.empreinte]
+  );
+  if (a2 && a2.statut === "APPROUVE") {
+    await base().exec("UPDATE appareils SET derniere_utilisation = ? WHERE id = ?", [t, a2.id]);
+    return { approuve: true, id: Number(a2.id) };
+  }
+  if (a2 && a2.statut === "RETIRE") {
+    throw new Erreur("Ce téléphone a été retiré par le super administrateur : il ne peut plus servir à vous connecter. Contactez-le.");
+  }
+  if (a2 && a2.statut === "EN_ATTENTE_ACCORD") return { approuve: false, reponse: { type: "APPAREIL", etape: "ACCORD", email: l.email } };
+  if (!a2) {
+    await transaction(async (tx) => {
+      await tx.exec("INSERT INTO appareils (utilisateur_id, cle_publique, empreinte, nom, statut, date_creation) VALUES (?, ?, ?, ?, 'EN_ATTENTE_CODE', ?) ON CONFLICT (utilisateur_id, empreinte) DO NOTHING", [l.id, preuve.cle, preuve.empreinte, preuve.nom, t]);
+      await journaliser(tx, l.id, "APPAREIL_NOUVEAU", "Connexion demandée depuis un nouveau téléphone : " + preuve.nom);
+    });
+  }
+  const p = await chargerParametres();
+  if (a2 && a2.date_envoi_code != null && t - Number(a2.date_envoi_code) < p.codeRenvoiSecondes * 1e3) {
+    return { approuve: false, reponse: { type: "APPAREIL", etape: "CODE", email: l.email, envoi: { envoye: true } } };
+  }
+  let envoi;
+  try {
+    envoi = await envoyerCode(l.id, l.email, l.nom_complet, "APPAREIL", preuve.empreinte);
+  } catch (e) {
+    envoi = { envoye: false, erreur: e instanceof Erreur ? e.message : "Envoi impossible." };
+  }
+  if (!config.modeTest) delete envoi.codeTest;
+  if (envoi.envoye) await base().exec("UPDATE appareils SET date_envoi_code = ? WHERE utilisateur_id = ? AND empreinte = ?", [t, l.id, preuve.empreinte]);
+  return { approuve: false, reponse: { type: "APPAREIL", etape: "CODE", email: l.email, envoi } };
+}
+async function approuverDans(tx, appareilId, utilisateurId, acteurId) {
+  const autres = await tx.lignes(
+    "SELECT id FROM appareils WHERE utilisateur_id = ? AND statut = 'APPROUVE' AND id <> ?",
+    [utilisateurId, appareilId]
+  );
+  for (const x of autres) {
+    await tx.exec("UPDATE appareils SET statut = 'RETIRE' WHERE id = ?", [x.id]);
+    await tx.exec("DELETE FROM sessions WHERE appareil_id = ?", [x.id]);
+  }
+  await tx.exec("UPDATE appareils SET statut = 'APPROUVE', date_approbation = ?, approuve_par = ? WHERE id = ?", [Date.now(), acteurId, appareilId]);
+}
+async function reponseConnexion(l, jeton) {
+  return {
+    type: "OK",
+    utilisateur: versUtilisateur(l),
+    jeton,
+    seSouvenir: false,
+    doitChangerMdp: !!l.doit_changer_mdp,
+    delaiInactivite: await delaiInactivite(l.role, l.deconnexion_minutes)
+  };
+}
+async function confirmerAppareil(args, ctx) {
+  if (ctx.application !== "partenaire") throw new Erreur(MESSAGE_APPLI_CLIENT);
+  const email = nettoyerEmail(args.email);
+  const preuve = verifierPreuve(args.appareil, "appareil", email);
+  const echec = "Code incorrect ou expiré. Reconnectez-vous pour recevoir un nouveau code.";
+  const l = await ligneParEmail(base(), email);
+  if (!l || l.statut !== "ACTIF" || !estRoleAdmin(l.role)) throw new Erreur(echec);
+  const a2 = await base().ligne("SELECT id, utilisateur_id, statut, nom FROM appareils WHERE utilisateur_id = ? AND empreinte = ? AND statut = 'EN_ATTENTE_CODE'", [l.id, preuve.empreinte]);
+  if (!a2) throw new Erreur(echec);
+  await consommerCode(l.id, "APPAREIL", args.code, preuve.empreinte);
+  const t = Date.now();
+  if (l.role === "SUPER_ADMIN") {
+    const jeton = await transaction(async (tx) => {
+      await approuverDans(tx, Number(a2.id), l.id, l.id);
+      await tx.exec("UPDATE appareils SET date_code = ?, derniere_utilisation = ? WHERE id = ?", [t, t, a2.id]);
+      await tx.exec("UPDATE utilisateurs SET derniere_connexion = ? WHERE id = ?", [t, l.id]);
+      await journaliser(tx, l.id, "APPAREIL_AUTORISE", "Téléphone « " + (a2.nom || "?") + " » enregistré (code e-mail) ; connexion réussie");
+      return ouvrirSession(tx, l, "partenaire", Number(a2.id));
+    });
+    return reponseConnexion(l, jeton);
+  }
+  await transaction(async (tx) => {
+    await tx.exec("UPDATE appareils SET statut = 'EN_ATTENTE_ACCORD', date_code = ? WHERE id = ?", [t, a2.id]);
+    await journaliser(tx, l.id, "APPAREIL_CODE", "Téléphone « " + (a2.nom || "?") + " » validé par le code e-mail : en attente de l’accord du super admin");
+    await tx.exec(
+      "INSERT INTO notifications (utilisateur_id, type, titre, message, lu, date_creation) SELECT id, 'APPAREIL', ?, ?, 0, ? FROM utilisateurs WHERE role = 'SUPER_ADMIN' AND statut = 'ACTIF'",
+      ["Téléphone à autoriser", l.nom_complet + " (" + l.email + ") demande à se connecter depuis « " + (a2.nom || "un nouveau téléphone") + " ». Autorisez-le dans Profil ▸ Téléphones des partenaires, ou retirez-le si ce n’est pas lui.", t]
+    );
+  });
+  return { type: "APPAREIL", etape: "ACCORD", email: l.email };
+}
+async function listerAppareils(acteur) {
+  exigerRole(acteur, ["SUPER_ADMIN"]);
+  return base().lignes(
+    "SELECT a.id, a.nom, a.statut, a.date_creation, a.date_code, a.date_approbation, a.derniere_utilisation, u.id AS utilisateur_id, u.nom_complet, u.email, u.role, (SELECT COUNT(*) FROM sessions s WHERE s.appareil_id = a.id) AS sessions FROM appareils a JOIN utilisateurs u ON u.id = a.utilisateur_id ORDER BY CASE a.statut WHEN 'EN_ATTENTE_ACCORD' THEN 0 WHEN 'APPROUVE' THEN 1 WHEN 'EN_ATTENTE_CODE' THEN 2 ELSE 3 END, a.id DESC LIMIT 200"
+  );
+}
+async function nombreAppareilsEnAttente(acteur) {
+  exigerRole(acteur, ["SUPER_ADMIN"]);
+  return Number(await base().valeur("SELECT COUNT(*) AS n FROM appareils WHERE statut = 'EN_ATTENTE_ACCORD'")) || 0;
+}
+async function approuverAppareil(acteur, args) {
+  exigerRole(acteur, ["SUPER_ADMIN"]);
+  const id = entier(args.id, "téléphone", 1);
+  await transaction(async (tx) => {
+    const a2 = await tx.ligne("SELECT a.id, a.utilisateur_id, a.statut, a.nom, u.email, u.nom_complet FROM appareils a JOIN utilisateurs u ON u.id = a.utilisateur_id WHERE a.id = ? FOR UPDATE", [id]);
+    if (!a2) throw new Erreur("Téléphone introuvable.");
+    if (a2.statut === "APPROUVE") throw new Erreur("Ce téléphone est déjà autorisé.");
+    if (a2.statut === "EN_ATTENTE_CODE") throw new Erreur("Ce téléphone n’a pas encore été validé par le code reçu par e-mail.");
+    await approuverDans(tx, Number(a2.id), Number(a2.utilisateur_id), acteur.id);
+    await notifier(
+      tx,
+      Number(a2.utilisateur_id),
+      "APPAREIL",
+      "Téléphone autorisé",
+      "Le super administrateur a autorisé « " + (a2.nom || "votre téléphone") + " ». Vous pouvez vous connecter."
+    );
+    await journaliser(tx, acteur.id, "APPAREIL_AUTORISE", "Téléphone « " + (a2.nom || "?") + " » autorisé pour " + a2.nom_complet + " (" + a2.email + ")");
+  });
+}
+async function retirerAppareil(acteur, session, args) {
+  exigerRole(acteur, ["SUPER_ADMIN"]);
+  const id = entier(args.id, "téléphone", 1);
+  if (session.appareilId === id) throw new Erreur("Vous ne pouvez pas retirer le téléphone que vous utilisez en ce moment.");
+  await transaction(async (tx) => {
+    const a2 = await tx.ligne("SELECT a.id, a.utilisateur_id, a.statut, a.nom, u.email, u.nom_complet FROM appareils a JOIN utilisateurs u ON u.id = a.utilisateur_id WHERE a.id = ? FOR UPDATE", [id]);
+    if (!a2) throw new Erreur("Téléphone introuvable.");
+    if (a2.statut === "RETIRE") return;
+    await tx.exec("UPDATE appareils SET statut = 'RETIRE' WHERE id = ?", [id]);
+    await tx.exec("DELETE FROM sessions WHERE appareil_id = ?", [id]);
+    await journaliser(tx, acteur.id, "APPAREIL_RETIRE", "Téléphone « " + (a2.nom || "?") + " » retiré pour " + a2.nom_complet + " (" + a2.email + ")");
+  });
+}
+async function reglerDeconnexion(acteur, args) {
+  exigerRole(acteur, ["ADMIN", "SUPER_ADMIN"]);
+  const minutes = entier(args.minutes, "délai", 1, 60);
+  if (CHOIX_DECONNEXION.indexOf(minutes) < 0) throw new Erreur("Choisissez un délai parmi : " + CHOIX_DECONNEXION.join(", ") + " minutes.");
+  await transaction(async (tx) => {
+    await tx.exec("UPDATE utilisateurs SET deconnexion_minutes = ? WHERE id = ?", [minutes, acteur.id]);
+    await tx.exec("UPDATE sessions SET delai_inactivite = ? WHERE utilisateur_id = ?", [minutes * 6e4, acteur.id]);
+    await journaliser(tx, acteur.id, "DECONNEXION_AUTO", "Déconnexion automatique après " + minutes + " minute" + (minutes > 1 ? "s" : "") + " sans activité");
+  });
+  return { delaiInactivite: minutes * 6e4 };
+}
+async function infoSession(acteur, session) {
+  const choix = estRoleAdmin(acteur.role) ? Number(await base().valeur("SELECT deconnexion_minutes FROM utilisateurs WHERE id = ?", [acteur.id])) || null : null;
+  return {
+    utilisateur: acteur,
+    seSouvenir: false,
+    doitChangerMdp: session.doitChanger,
+    application: session.application,
+    delaiInactivite: session.delaiInactivite,
+    deconnexionMinutes: choix,
+    choixDeconnexion: estRoleAdmin(acteur.role) ? CHOIX_DECONNEXION : []
+  };
+}
+async function seConnecter(args, ctx = { application: "client", inactivite: null }) {
   const email = nettoyerEmail(args.email);
   const motDePasse = lireMotDePasse(args.motDePasse);
-  const seSouvenir = booleen(args.seSouvenir);
   if (!emailValide(email)) throw new Erreur("Saisissez une adresse e-mail valide.");
   if (!motDePasse) throw new Erreur("Saisissez votre mot de passe.");
+  const preuve = ctx.application === "partenaire" ? verifierPreuve(args.appareil, "connexion", email) : null;
   const l = await ligneParEmail(base(), email);
   if (!l) {
     await pbkdf2Hex(motDePasse, SEL_FACTICE, ITERATIONS);
@@ -884,6 +1201,13 @@ async function seConnecter(args) {
   }
   await verifierAvecTentatives(l, motDePasse, MESSAGE_IDENTIFIANTS, true);
   if (l.statut !== "ACTIF") throw new Erreur("Votre compte est bloqué. Contactez l’administrateur.");
+  exigerBonneApplication(l.role, ctx.application);
+  let appareilId = null;
+  if (preuve) {
+    const a2 = await appareilPourConnexion(l, preuve);
+    if (!a2.approuve) return a2.reponse;
+    appareilId = a2.id;
+  }
   if (!l.email_verifie) {
     let envoi;
     try {
@@ -900,41 +1224,49 @@ async function seConnecter(args) {
       await tx.exec("UPDATE utilisateurs SET mot_de_passe_hash = ?, sel = ?, iterations = ? WHERE id = ?", [renforce.hash, renforce.sel, renforce.iterations, l.id]);
     }
     await tx.exec("UPDATE utilisateurs SET tentatives_echouees = 0, verrouille_jusqua = NULL, derniere_connexion = ? WHERE id = ?", [t, l.id]);
-    await journaliser(tx, l.id, "CONNEXION", "Connexion réussie");
-    return ouvrirSession(tx, l.id, seSouvenir);
+    await journaliser(tx, l.id, "CONNEXION", "Connexion réussie" + (appareilId ? " (téléphone enregistré)" : ""));
+    return ouvrirSession(tx, l, ctx.application, appareilId);
   });
-  const u = versUtilisateur(l);
-  return { type: "OK", utilisateur: u, jeton, seSouvenir, doitChangerMdp: !!l.doit_changer_mdp };
+  return reponseConnexion(l, jeton);
 }
-function empreinteCode(utilisateurId, type, code) {
-  return sha256Hex("dj-wallet-exchange|" + utilisateurId + "|" + type + "|" + code);
+function empreinteCode(utilisateurId, type, code, lien = "") {
+  return sha256Hex("dj-wallet-exchange|" + utilisateurId + "|" + type + "|" + code + (lien ? "|" + lien : ""));
 }
 function messagePatientez(secondes) {
   return "Un code vient d’être envoyé. Patientez " + secondes + " s avant d’en demander un nouveau.";
 }
-async function envoyerCode(utilisateurId, email, nom, type) {
+var MAX_CODES_APPAREIL_HEURE = 5;
+async function envoyerCode(utilisateurId, email, nom, type, lien = "") {
   const p = await chargerParametres();
   const code = String(aleaEntier(1e6)).padStart(6, "0");
   await transaction(async (tx) => {
     await tx.exec("SELECT id FROM utilisateurs WHERE id = ? FOR UPDATE", [utilisateurId]);
     const t = Date.now();
-    const dernier = await tx.valeur(
-      "SELECT date_creation FROM codes_verification WHERE utilisateur_id = ? AND type = ? ORDER BY id DESC LIMIT 1",
-      [utilisateurId, type]
-    );
-    if (dernier != null && t - dernier < p.codeRenvoiSecondes * 1e3) {
-      throw new Erreur(messagePatientez(Math.ceil((p.codeRenvoiSecondes * 1e3 - (t - dernier)) / 1e3)));
+    if (type === "APPAREIL") {
+      const n = Number(await tx.valeur(
+        "SELECT COUNT(*) AS n FROM codes_verification WHERE utilisateur_id = ? AND type = ? AND date_creation > ?",
+        [utilisateurId, type, t - 3600 * 1e3]
+      ));
+      if (n >= MAX_CODES_APPAREIL_HEURE) throw new Erreur("Trop de codes envoyés pour ce compte : patientez une heure avant d’enregistrer un téléphone.");
+    } else {
+      const dernier = await tx.valeur(
+        "SELECT date_creation FROM codes_verification WHERE utilisateur_id = ? AND type = ? ORDER BY id DESC LIMIT 1",
+        [utilisateurId, type]
+      );
+      if (dernier != null && t - dernier < p.codeRenvoiSecondes * 1e3) {
+        throw new Erreur(messagePatientez(Math.ceil((p.codeRenvoiSecondes * 1e3 - (t - dernier)) / 1e3)));
+      }
     }
     await tx.exec("UPDATE codes_verification SET utilise = 1 WHERE utilisateur_id = ? AND type = ? AND utilise = 0", [utilisateurId, type]);
     await tx.exec(
       "INSERT INTO codes_verification (utilisateur_id, type, code_hash, expire_le, tentatives, utilise, date_creation) VALUES (?, ?, ?, ?, 0, 0, ?)",
-      [utilisateurId, type, empreinteCode(utilisateurId, type, code), t + p.codeValiditeMinutes * 6e4, t]
+      [utilisateurId, type, empreinteCode(utilisateurId, type, code, lien), t + p.codeValiditeMinutes * 6e4, t]
     );
   });
   const envoi = await envoyerCodeEmail(type, email, nom, code, p.codeValiditeMinutes);
   if (envoi.ok) return { envoye: true };
   const res = { envoye: false, erreur: envoi.erreur || "Envoi impossible." };
-  if (config.modeTest && type === "INSCRIPTION") res.codeTest = code;
+  if (config.modeTest && (type === "INSCRIPTION" || type === "APPAREIL")) res.codeTest = code;
   return res;
 }
 async function envoiFictif(email, type) {
@@ -973,7 +1305,7 @@ async function renvoyerCode(args) {
   if (!l || l.statut !== "ACTIF" || type === "INSCRIPTION" && l.email_verifie) return envoiFictif(email, type);
   return envoyerCode(l.id, l.email, l.nom_complet, type);
 }
-async function consommerCode(utilisateurId, type, codeBrut) {
+async function consommerCode(utilisateurId, type, codeBrut, lien = "") {
   const code = texte(codeBrut, "code", 20).replace(/\D/g, "");
   if (code.length !== 6) throw new Erreur("Saisissez le code à 6 chiffres reçu par e-mail.");
   const erreur = await transaction(async (tx) => {
@@ -984,7 +1316,7 @@ async function consommerCode(utilisateurId, type, codeBrut) {
     if (!l) return "Aucun code en attente. Demandez un nouveau code.";
     if (l.expire_le < Date.now()) return "Ce code a expiré. Demandez un nouveau code.";
     if (l.tentatives >= MAX_ESSAIS_CODE) return "Trop d’essais. Demandez un nouveau code.";
-    if (!egalConstant(empreinteCode(utilisateurId, type, code), l.code_hash)) {
+    if (!egalConstant(empreinteCode(utilisateurId, type, code, lien), l.code_hash)) {
       await tx.exec("UPDATE codes_verification SET tentatives = tentatives + 1 WHERE id = ?", [l.id]);
       const restant = MAX_ESSAIS_CODE - (l.tentatives + 1);
       return restant > 0 ? "Code incorrect. Il vous reste " + restant + " essai" + (restant > 1 ? "s" : "") + "." : "Code incorrect. Demandez un nouveau code.";
@@ -1218,23 +1550,38 @@ async function desactiverEmpreinte(acteur, args) {
     await journaliser(tx, acteur.id, "EMPREINTE_DESACTIVEE", "Connexion par empreinte digitale désactivée");
   });
 }
-async function seConnecterParEmpreinte(args) {
+async function seConnecterParEmpreinte(args, ctx = { application: "client", inactivite: null }) {
   const jeton = args.jeton;
-  if (!jetonValide(jeton)) throw new ErreurHttp(400, "EMPREINTE_INVALIDE", "La connexion par empreinte n’est plus valable. Connectez-vous avec votre mot de passe.");
+  const invalide = "La connexion par empreinte n’est plus valable. Connectez-vous avec votre mot de passe.";
+  if (!jetonValide(jeton)) throw new ErreurHttp(400, "EMPREINTE_INVALIDE", invalide);
   const l = await base().ligne(
-    "SELECT a.id AS acces_id, u.id AS id, u.nom_complet AS nom_complet, u.email AS email, u.telephone AS telephone, u.role AS role, u.statut AS statut, u.email_verifie AS email_verifie, u.date_creation AS date_creation, u.derniere_connexion AS derniere_connexion, u.doit_changer_mdp AS doit_changer_mdp FROM acces_biometriques a JOIN utilisateurs u ON u.id = a.utilisateur_id WHERE a.jeton_hash = ?",
+    "SELECT a.id AS acces_id, u.id AS id, u.nom_complet AS nom_complet, u.email AS email, u.telephone AS telephone, u.role AS role, u.statut AS statut, u.email_verifie AS email_verifie, u.date_creation AS date_creation, u.derniere_connexion AS derniere_connexion, u.doit_changer_mdp AS doit_changer_mdp, u.deconnexion_minutes AS deconnexion_minutes FROM acces_biometriques a JOIN utilisateurs u ON u.id = a.utilisateur_id WHERE a.jeton_hash = ?",
     [sha256Hex(jeton)]
   );
-  if (!l) throw new ErreurHttp(400, "EMPREINTE_INVALIDE", "La connexion par empreinte n’est plus valable. Connectez-vous avec votre mot de passe.");
+  if (!l) throw new ErreurHttp(400, "EMPREINTE_INVALIDE", invalide);
   if (l.statut !== "ACTIF") throw new Erreur("Votre compte est bloqué. Contactez l’administrateur.");
+  exigerBonneApplication(l.role, ctx.application);
+  let appareilId = null;
+  if (ctx.application === "partenaire") {
+    const preuve = verifierPreuve(args.appareil, "empreinte", l.email);
+    const a2 = await base().ligne(
+      "SELECT id, statut FROM appareils WHERE utilisateur_id = ? AND empreinte = ?",
+      [l.id, preuve.empreinte]
+    );
+    if (!a2 || a2.statut !== "APPROUVE") {
+      throw new ErreurHttp(400, "EMPREINTE_INVALIDE", "Ce téléphone n’est pas autorisé : connectez-vous avec votre mot de passe.");
+    }
+    appareilId = Number(a2.id);
+  }
   const t = Date.now();
   const session = await transaction(async (tx) => {
     await tx.exec("UPDATE utilisateurs SET derniere_connexion = ? WHERE id = ?", [t, l.id]);
     await tx.exec("UPDATE acces_biometriques SET derniere_utilisation = ? WHERE id = ?", [t, l.acces_id]);
-    await journaliser(tx, l.id, "CONNEXION", "Connexion par empreinte digitale");
-    return ouvrirSession(tx, l.id, false);
+    if (appareilId) await tx.exec("UPDATE appareils SET derniere_utilisation = ? WHERE id = ?", [t, appareilId]);
+    await journaliser(tx, l.id, "CONNEXION", "Connexion par empreinte digitale" + (appareilId ? " (téléphone enregistré)" : ""));
+    return ouvrirSession(tx, l, ctx.application, appareilId);
   });
-  return { utilisateur: versUtilisateur(l), jeton: session, doitChangerMdp: !!l.doit_changer_mdp };
+  return { utilisateur: versUtilisateur(l), jeton: session, doitChangerMdp: !!l.doit_changer_mdp, delaiInactivite: await delaiInactivite(l.role, l.deconnexion_minutes) };
 }
 function limiter(groupe, ip) {
   if (!autoriser(groupe, ip)) {
@@ -1334,6 +1681,64 @@ async function versionPasserelle(t) {
     await t.exec("INSERT INTO parametres (cle, valeur, description) VALUES (?, ?, ?) ON CONFLICT (cle) DO NOTHING", [cle, valeur, description]);
   }
 }
+async function versionPartenaire(t, actions) {
+  await t.exec("ALTER TABLE utilisateurs ADD COLUMN IF NOT EXISTS deconnexion_minutes BIGINT");
+  await t.exec("ALTER TABLE utilisateurs ADD COLUMN IF NOT EXISTS verrouillages BIGINT NOT NULL DEFAULT 0");
+  await t.exec("ALTER TABLE utilisateurs ADD COLUMN IF NOT EXISTS dernier_verrouillage BIGINT");
+  await t.exec("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS application TEXT");
+  await t.exec("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS appareil_id BIGINT");
+  await t.exec("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS derniere_activite BIGINT");
+  await t.exec("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS delai_inactivite BIGINT");
+  await t.exec("CREATE TABLE IF NOT EXISTS appareils (id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, utilisateur_id BIGINT NOT NULL REFERENCES utilisateurs (id) ON DELETE CASCADE, cle_publique TEXT NOT NULL, empreinte TEXT NOT NULL, nom TEXT, statut TEXT NOT NULL CHECK (statut IN ('EN_ATTENTE_CODE', 'EN_ATTENTE_ACCORD', 'APPROUVE', 'RETIRE')), date_creation BIGINT NOT NULL, date_envoi_code BIGINT, date_code BIGINT, date_approbation BIGINT, approuve_par BIGINT, derniere_utilisation BIGINT, UNIQUE (utilisateur_id, empreinte))");
+  await t.exec("CREATE INDEX IF NOT EXISTS idx_appareils_statut ON appareils (statut, utilisateur_id)");
+  await t.exec("ALTER TABLE appareils ENABLE ROW LEVEL SECURITY");
+  await t.exec("ALTER TABLE codes_verification DROP CONSTRAINT IF EXISTS codes_verification_type_check");
+  await t.exec("ALTER TABLE codes_verification ADD CONSTRAINT codes_verification_type_check CHECK (type IN ('INSCRIPTION', 'REINITIALISATION', 'APPAREIL'))");
+  await t.exec("ALTER TABLE demandes_echange ADD COLUMN IF NOT EXISTS intervention_notifiee BIGINT NOT NULL DEFAULT 0");
+  await t.exec("ALTER TABLE messages_passerelle ADD COLUMN IF NOT EXISTS titre TEXT");
+  await t.exec("UPDATE parametres SET valeur = '2' WHERE cle = 'passerelle_delai_paiement_minutes' AND valeur = '10'");
+  const defauts = [
+    ["passerelle_delai_paiement_minutes", "2", "Passerelle : demande refusée (paiement non reçu) si aucun paiement n’arrive dans ce délai (minutes)"],
+    ["passerelle_attente_message_secondes", "15", "Passerelle : sans SMS ni notification après ce délai (secondes), le solde est lu à l’écran"],
+    ["passerelle_delai_intervention_minutes", "3", "Passerelle : le client apprend qu’un administrateur doit intervenir après ce délai (minutes)"],
+    ["session_client_minutes", "2", "Déconnexion automatique d’un client sans activité (minutes)"],
+    ["session_admin_minutes", "5", "Déconnexion automatique d’un administrateur sans activité, s’il n’a pas choisi (minutes)"]
+  ];
+  for (const [cle, valeur, description] of defauts) {
+    await t.exec("INSERT INTO parametres (cle, valeur, description) VALUES (?, ?, ?) ON CONFLICT (cle) DO NOTHING", [cle, valeur, description]);
+  }
+  const fermees = await t.exec("DELETE FROM sessions WHERE utilisateur_id IN (SELECT id FROM utilisateurs WHERE role IN ('ADMIN', 'SUPER_ADMIN'))");
+  await t.exec("DELETE FROM acces_biometriques WHERE utilisateur_id IN (SELECT id FROM utilisateurs WHERE role IN ('ADMIN', 'SUPER_ADMIN'))");
+  actions.push("Application Partenaire : téléphones enregistrés, déconnexion après inactivité ; " + fermees + " session(s) d’administrateur fermée(s) (reconnexion avec l’application Partenaire)");
+}
+async function versionPlafonds(t, actions) {
+  await t.exec("CREATE TABLE IF NOT EXISTS plafonds_envoi (id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, type TEXT NOT NULL CHECK (type IN ('COMPTE', 'NUMERO')), cle TEXT NOT NULL, limite_jour BIGINT NOT NULL, alerte_jour BIGINT NOT NULL DEFAULT 0, motif TEXT, par BIGINT REFERENCES utilisateurs (id) ON DELETE SET NULL, date_maj BIGINT NOT NULL, UNIQUE (type, cle))");
+  await t.exec("CREATE TABLE IF NOT EXISTS alertes_envoi (id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, type TEXT NOT NULL CHECK (type IN ('COMPTE', 'NUMERO', 'GLOBAL')), cle TEXT NOT NULL, jour BIGINT NOT NULL, nature TEXT NOT NULL CHECK (nature IN ('ALERTE', 'LIMITE')), montant BIGINT, date_creation BIGINT NOT NULL, UNIQUE (type, cle, jour, nature))");
+  await t.exec("CREATE TABLE IF NOT EXISTS mouvements_solde (id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, wallet_id BIGINT NOT NULL REFERENCES wallets (id) ON DELETE CASCADE, operateur TEXT CHECK (operateur IS NULL OR operateur IN ('DMONEY', 'WAAFI')), type TEXT NOT NULL CHECK (type IN ('RECHARGE', 'REMBOURSEMENT', 'RETRAIT', 'CORRECTION')), sens TEXT NOT NULL CHECK (sens IN ('ENTREE', 'SORTIE')), montant BIGINT NOT NULL CHECK (montant > 0), demande_id BIGINT REFERENCES demandes_echange (id) ON DELETE SET NULL, operation_ref BIGINT REFERENCES operations_operateur (id) ON DELETE SET NULL, operation_id TEXT, note TEXT, date_mouvement BIGINT NOT NULL, par BIGINT REFERENCES utilisateurs (id) ON DELETE SET NULL, date_creation BIGINT NOT NULL)");
+  await t.exec("CREATE INDEX IF NOT EXISTS idx_mouvements_operateur ON mouvements_solde (operateur, date_mouvement)");
+  await t.exec("CREATE INDEX IF NOT EXISTS idx_mouvements_wallet ON mouvements_solde (wallet_id, id)");
+  await t.exec("CREATE INDEX IF NOT EXISTS idx_demandes_jour_client ON demandes_echange (utilisateur_id, date_creation)");
+  await t.exec("CREATE INDEX IF NOT EXISTS idx_demandes_jour_numero ON demandes_echange (numero_dest, date_creation)");
+  await t.exec("CREATE INDEX IF NOT EXISTS idx_demandes_date_creation ON demandes_echange (date_creation)");
+  for (const table of ["plafonds_envoi", "alertes_envoi", "mouvements_solde"]) {
+    await t.exec("ALTER TABLE " + table + " ENABLE ROW LEVEL SECURITY");
+  }
+  await t.exec("ALTER TABLE operations_operateur DROP CONSTRAINT IF EXISTS operations_operateur_role_check");
+  await t.exec("ALTER TABLE operations_operateur ADD CONSTRAINT operations_operateur_role_check CHECK (role IS NULL OR role IN ('PAIEMENT', 'VERSEMENT', 'MOUVEMENT'))");
+  await t.exec("ALTER TABLE demandes_echange ADD COLUMN IF NOT EXISTS montant_rembourse BIGINT NOT NULL DEFAULT 0");
+  await t.exec("ALTER TABLE demandes_echange ADD COLUMN IF NOT EXISTS date_remboursement BIGINT");
+  const defauts = [
+    ["limite_envoi_jour", "100000", "Montant maximum envoyé par le service par jour pour un compte client, et vers un numéro destinataire (FDJ ; 0 : aucune)"],
+    ["alerte_envoi_jour", "50000", "Alerte aux administrateurs quand un compte ou un numéro atteint ce montant dans la journée (FDJ ; 0 : pas d’alerte)"],
+    ["limite_globale_jour", "0", "Montant total maximum envoyé par le service par jour, tous clients confondus (FDJ ; 0 : aucune)"],
+    ["service_suspendu", "0", "Service d’échange suspendu par le super admin (1) : aucune nouvelle demande"],
+    ["message_suspension", "", "Message montré aux clients pendant la suspension du service"]
+  ];
+  for (const [cle, valeur, description] of defauts) {
+    await t.exec("INSERT INTO parametres (cle, valeur, description) VALUES (?, ?, ?) ON CONFLICT (cle) DO NOTHING", [cle, valeur, description]);
+  }
+  actions.push("Limites d’envoi du service par jour (100 000 FDJ par compte et par numéro, alerte à 50 000 FDJ), suspension du service, mouvements de solde");
+}
 async function migrer() {
   return transaction(async (t) => {
     await t.exec("SELECT pg_advisory_xact_lock(7230142)");
@@ -1360,6 +1765,8 @@ async function migrer() {
       await versionPasserelle(t);
       actions.push("Passerelle téléphone : tables et réglages du test créés");
     }
+    if (version < 5) await versionPartenaire(t, actions);
+    if (version < 6) await versionPlafonds(t, actions);
     await t.exec(
       "INSERT INTO meta_schema (cle, valeur) VALUES ('version', ?) ON CONFLICT (cle) DO UPDATE SET valeur = EXCLUDED.valeur",
       [String(VERSION_SCHEMA)]
@@ -1568,6 +1975,252 @@ function normaliserExpediteur(e) {
   return (e || "").toUpperCase().replace(/[^A-Z0-9.]/g, "");
 }
 
+// src/plafonds.ts
+var JOUR = 24 * 3600 * 1e3;
+var COMPTEES = "statut NOT IN ('REFUSEE', 'ANNULEE')";
+var ALERTE_GLOBALE = 0.8;
+var RELEVABLES = ["COMPTE", "NUMERO"];
+function debutJour(t) {
+  const decalage = config.decalageMinutes * 6e4;
+  return Math.floor((t + decalage) / JOUR) * JOUR - decalage;
+}
+function cleVerrou(type, cle) {
+  return parseInt(sha256Hex("djx-plafond|" + type + "|" + cle).substring(0, 12), 16);
+}
+async function plafondDe(b, type, cle) {
+  const p = await chargerParametres(b);
+  if (type === "GLOBAL") return { limite: p.limiteGlobaleJour, alerte: Math.round(p.limiteGlobaleJour * ALERTE_GLOBALE), special: false };
+  const l = await b.ligne(
+    "SELECT limite_jour, alerte_jour FROM plafonds_envoi WHERE type = ? AND cle = ?",
+    [type, cle]
+  );
+  if (l) return { limite: Number(l.limite_jour), alerte: Number(l.alerte_jour), special: true };
+  return { limite: p.limiteEnvoiJour, alerte: p.alerteEnvoiJour, special: false };
+}
+async function totalDuJour(b, type, cle, jour, sauf = null) {
+  const filtre = type === "COMPTE" ? "utilisateur_id = ? AND " : type === "NUMERO" ? "numero_dest = ? AND " : "";
+  const args = type === "COMPTE" ? [Number(cle)] : type === "NUMERO" ? [cle] : [];
+  args.push(jour);
+  if (sauf != null) args.push(sauf);
+  return Number(await b.valeur("SELECT COALESCE(SUM(montant_net), 0) AS s FROM demandes_echange WHERE " + filtre + "date_creation >= ? AND " + COMPTEES + (sauf != null ? " AND id <> ?" : ""), args)) || 0;
+}
+async function entites(b, utilisateurId, numeroDest) {
+  const l = [["COMPTE", String(utilisateurId)], ["NUMERO", numeroDest]];
+  if ((await chargerParametres(b)).limiteGlobaleJour > 0) l.push(["GLOBAL", "TOUS"]);
+  return l;
+}
+var DepassementPlafond = class extends ErreurHttp {
+  constructor(d, message) {
+    super(400, "LIMITE_ENVOI", message);
+    this.d = d;
+    this.name = "DepassementPlafond";
+  }
+  d;
+};
+function messageClient(x) {
+  const reste = Math.max(0, x.plafond.limite - x.total);
+  if (x.type === "GLOBAL") {
+    return "Le service a atteint son montant maximum d’envois pour aujourd’hui. Réessayez demain, ou avec un montant plus petit" + (reste >= 100 ? " (" + fdj(reste) + " au plus)" : "") + ".";
+  }
+  return "Limite d’envoi atteinte" + (x.type === "NUMERO" ? " pour le numéro destinataire " + formatNumero(x.cle) : "") + " : Dj Wallet Exchange a déjà envoyé (ou doit envoyer) " + fdj(x.total) + " aujourd’hui " + (x.type === "NUMERO" ? "à ce numéro" : "pour vos échanges") + " (limite : " + fdj(x.plafond.limite) + " par jour). " + (reste > 0 ? "Il peut encore envoyer " + fdj(reste) + " aujourd’hui" + (x.type === "NUMERO" ? " à ce numéro. " : ". ") : "Plus aucun envoi n’est possible aujourd’hui" + (x.type === "NUMERO" ? " vers ce numéro. " : ". ")) + "Un administrateur a été prévenu : après vérification, il peut relever cette limite.";
+}
+async function controlerPlafonds(tx, utilisateurId, numeroDest, net, t) {
+  const jour = debutJour(t);
+  const liste = await entites(tx, utilisateurId, numeroDest);
+  for (const [type, cle] of liste) await tx.exec("SELECT pg_advisory_xact_lock(?::bigint)", [cleVerrou(type, cle)]);
+  const franchis = [];
+  for (const [type, cle] of liste) {
+    const plafond = await plafondDe(tx, type, cle);
+    const total = await totalDuJour(tx, type, cle, jour);
+    if (plafond.limite > 0 && total + net > plafond.limite) {
+      const x = { type, cle, total, montant: net, plafond };
+      throw new DepassementPlafond(x, messageClient(x));
+    }
+    if (plafond.alerte > 0 && total < plafond.alerte && total + net >= plafond.alerte) franchis.push({ type, cle, total: total + net, plafond });
+  }
+  return franchis;
+}
+async function depassementEnvoi(b, d) {
+  const jour = debutJour(Number(d.date_creation));
+  for (const [type, cle] of await entites(b, d.utilisateur_id, d.numero_dest)) {
+    const plafond = await plafondDe(b, type, cle);
+    if (plafond.limite <= 0) continue;
+    const total = await totalDuJour(b, type, cle, jour, d.id);
+    if (total + Number(d.montant_net) > plafond.limite) return { type, cle, total, montant: Number(d.montant_net), plafond };
+  }
+  return null;
+}
+function texteDepassement(x, client) {
+  const qui = x.type === "COMPTE" ? "pour " + (client || "ce client") : x.type === "NUMERO" ? "vers le numéro " + formatNumero(x.cle) : "par le service (tous clients)";
+  return "limite d’envoi par jour atteinte " + qui + " : " + fdj(x.total) + " déjà envoyés ou à envoyer aujourd’hui, + " + fdj(x.montant) + " dépasserait " + fdj(x.plafond.limite);
+}
+async function premiereAlerte(b, type, cle, nature, montant, t) {
+  const id = await b.valeur("INSERT INTO alertes_envoi (type, cle, jour, nature, montant, date_creation) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (type, cle, jour, nature) DO NOTHING RETURNING id", [type, cle, debutJour(t), nature, montant, t]);
+  return id != null;
+}
+function libelleEntite(type, cle, client) {
+  return type === "COMPTE" ? client.nom_complet + " (" + client.email + ")" : type === "NUMERO" ? "le numéro " + formatNumero(cle) : "le service (tous clients)";
+}
+async function alerterFranchissements(tx, client, demandeId, franchis) {
+  const t = Date.now();
+  const nouveaux = [];
+  for (const f of franchis) if (await premiereAlerte(tx, f.type, f.cle, "ALERTE", f.total, t)) nouveaux.push(f);
+  if (!nouveaux.length) return;
+  const parties = nouveaux.map((f) => fdj(f.total) + " à envoyer aujourd’hui " + (f.type === "COMPTE" ? "pour " : f.type === "NUMERO" ? "vers " : "par ") + libelleEntite(f.type, f.cle, client) + " (seuil d’alerte " + fdj(f.plafond.alerte) + ", limite " + (f.plafond.limite > 0 ? fdj(f.plafond.limite) : "aucune") + ")");
+  const f0 = nouveaux[0];
+  const titre = f0.type === "COMPTE" ? client.nom_complet : f0.type === "NUMERO" ? formatNumero(f0.cle) : "total du service";
+  await notifierAdmins(tx, "LIMITE_ALERTE", "Seuil d’alerte d’envoi atteint : " + titre, parties.join(" ; ") + ". Vérifiez dans Limites d’envoi.", demandeId);
+  await journaliser(tx, null, "LIMITE_ALERTE", "Seuil d’alerte d’envoi atteint : " + parties.join(" ; "));
+}
+async function signalerDepassement(client, e) {
+  const x = e.d;
+  const t = Date.now();
+  await transaction(async (tx) => {
+    if (!await premiereAlerte(tx, x.type, x.cle, "LIMITE", x.total + x.montant, t)) return;
+    await notifierAdmins(tx, "LIMITE_ATTEINTE", "Limite d’envoi atteinte : " + (x.type === "COMPTE" ? client.nom_complet : x.type === "NUMERO" ? formatNumero(x.cle) : "total du service"), "Demande de " + client.nom_complet + " (" + client.email + ") refusée : " + texteDepassement(x, client.nom_complet) + ". Vérifiez puis, si tout est en règle, relevez la limite dans Limites d’envoi.");
+    await journaliser(tx, client.id, "LIMITE_ATTEINTE", "Demande refusée : " + texteDepassement(x, client.nom_complet));
+  });
+}
+async function noterEnvoiArrete(b, x) {
+  await premiereAlerte(b, x.type, x.cle, "LIMITE", x.total + x.montant, Date.now());
+}
+async function situationClient(b, acteur) {
+  const jour = debutJour(Date.now());
+  const plafond = await plafondDe(b, "COMPTE", String(acteur.id));
+  return { envoyeJour: await totalDuJour(b, "COMPTE", String(acteur.id), jour), limiteJour: plafond.limite };
+}
+async function listerPlafonds(acteur) {
+  exigerRole(acteur, ["ADMIN", "SUPER_ADMIN"]);
+  const b = base();
+  const p = await chargerParametres(b);
+  const jour = debutJour(Date.now());
+  const speciaux = await b.lignes("SELECT pl.type, pl.cle, pl.limite_jour, pl.alerte_jour, pl.motif, pl.date_maj, a.nom_complet AS par_nom FROM plafonds_envoi pl LEFT JOIN utilisateurs a ON a.id = pl.par");
+  const alertes = await b.lignes("SELECT type, cle, nature FROM alertes_envoi WHERE jour = ?", [jour]);
+  const somme = "SUM(montant_net) AS total, SUM(CASE WHEN statut = 'TRAITEE' THEN montant_net ELSE 0 END) AS envoye, COUNT(*) AS nb";
+  const comptes = await b.lignes(
+    "SELECT u.id, u.nom_complet, u.email, COALESCE(t.total, 0) AS total, COALESCE(t.envoye, 0) AS envoye, COALESCE(t.nb, 0) AS nb FROM utilisateurs u LEFT JOIN (SELECT utilisateur_id, " + somme + " FROM demandes_echange WHERE date_creation >= ? AND " + COMPTEES + " GROUP BY utilisateur_id) t ON t.utilisateur_id = u.id WHERE u.role = 'UTILISATEUR' AND (t.total > 0 OR EXISTS (SELECT 1 FROM plafonds_envoi pl WHERE pl.type = 'COMPTE' AND pl.cle = CAST(u.id AS TEXT)) OR EXISTS (SELECT 1 FROM alertes_envoi al WHERE al.type = 'COMPTE' AND al.cle = CAST(u.id AS TEXT) AND al.jour = ?)) ORDER BY COALESCE(t.total, 0) DESC, u.id LIMIT 300",
+    [jour, jour]
+  );
+  const numeros = await b.lignes(
+    "SELECT numero_dest AS numero, " + somme + ", COUNT(DISTINCT utilisateur_id) AS comptes FROM demandes_echange WHERE date_creation >= ? AND " + COMPTEES + " GROUP BY numero_dest ORDER BY SUM(montant_net) DESC LIMIT 300",
+    [jour]
+  );
+  const global = await b.ligne("SELECT COALESCE(SUM(montant_net), 0) AS total, COALESCE(SUM(CASE WHEN statut = 'TRAITEE' THEN montant_net ELSE 0 END), 0) AS envoye, COUNT(*) AS nb FROM demandes_echange WHERE date_creation >= ? AND " + COMPTEES, [jour]);
+  const ligne = (type, cle, libelle, detail, x) => {
+    const s2 = speciaux.filter((y) => y.type === type && y.cle === cle)[0];
+    const limite = s2 ? Number(s2.limite_jour) : p.limiteEnvoiJour;
+    const alerte = s2 ? Number(s2.alerte_jour) : p.alerteEnvoiJour;
+    const total = x ? Number(x.total) || 0 : 0;
+    const vues = alertes.filter((a2) => a2.type === type && a2.cle === cle);
+    return {
+      type,
+      cle,
+      libelle,
+      detail,
+      total,
+      envoye: x ? Number(x.envoye) || 0 : 0,
+      nb: x ? Number(x.nb) || 0 : 0,
+      limite,
+      alerte,
+      special: !!s2,
+      motif: s2 ? s2.motif : null,
+      par_nom: s2 ? s2.par_nom : null,
+      date_maj: s2 ? Number(s2.date_maj) : null,
+      alerteAtteinte: vues.some((a2) => a2.nature === "ALERTE") || alerte > 0 && total >= alerte,
+      limiteAtteinte: vues.some((a2) => a2.nature === "LIMITE") || limite > 0 && total >= limite
+    };
+  };
+  const lignesComptes = comptes.map((c) => ligne("COMPTE", String(c.id), c.nom_complet, c.email, c));
+  const lignesNumeros = numeros.map((n) => ligne(
+    "NUMERO",
+    n.numero,
+    formatNumero(n.numero),
+    Number(n.comptes) > 1 ? n.comptes + " comptes clients" : "1 compte client",
+    n
+  ));
+  const vus = lignesNumeros.map((l) => l.cle);
+  const ajouter = (cle) => {
+    if (vus.indexOf(cle) >= 0) return;
+    lignesNumeros.push(ligne("NUMERO", cle, formatNumero(cle), "", null));
+    vus.push(cle);
+  };
+  speciaux.filter((s2) => s2.type === "NUMERO").forEach((s2) => ajouter(s2.cle));
+  alertes.filter((a2) => a2.type === "NUMERO").forEach((a2) => ajouter(a2.cle));
+  const rang = (l) => l.limiteAtteinte ? 0 : l.alerteAtteinte ? 1 : 2;
+  const trier = (l) => l.sort((x, y) => rang(x) - rang(y) || y.total - x.total);
+  return {
+    jour,
+    limite: p.limiteEnvoiJour,
+    alerte: p.alerteEnvoiJour,
+    service: {
+      total: global ? Number(global.total) : 0,
+      envoye: global ? Number(global.envoye) : 0,
+      nb: global ? Number(global.nb) : 0,
+      limite: p.limiteGlobaleJour,
+      limiteAtteinte: alertes.some((a2) => a2.type === "GLOBAL" && a2.nature === "LIMITE")
+    },
+    comptes: trier(lignesComptes),
+    numeros: trier(lignesNumeros)
+  };
+}
+function lireEntite(args) {
+  const type = parmi(args.type, RELEVABLES, "type");
+  if (type === "COMPTE") return { type, cle: String(entier(args.cle, "compte", 1)) };
+  const numero = normaliserNumero(texte(args.cle, "numéro", 30));
+  if (!numero) throw new Erreur("Le numéro doit contenir 8 chiffres.");
+  return { type, cle: numero };
+}
+async function definirPlafond(acteur, args) {
+  exigerRole(acteur, ["ADMIN", "SUPER_ADMIN"]);
+  const { type, cle } = lireEntite(args);
+  const p = await chargerParametres(base());
+  const limite = entier(args.limite, "limite par jour", 1, 1e9);
+  if (limite < p.montantMin) throw new Erreur("La limite par jour doit être d’au moins " + fdj(p.montantMin) + ".");
+  const alerte = entier(args.alerte == null ? 0 : args.alerte, "seuil d’alerte", 0, 1e9);
+  if (alerte > limite) throw new Erreur("Le seuil d’alerte doit être inférieur ou égal à la limite par jour.");
+  const motif = texte(args.motif, "motif", 200).replace(/\s+/g, " ").trim();
+  if (motif.length < 3) throw new Erreur("Indiquez le motif (ce que vous avez vérifié).");
+  const t = Date.now();
+  await transaction(async (tx) => {
+    let qui = "le numéro " + formatNumero(cle);
+    let client = null;
+    if (type === "COMPTE") {
+      client = await tx.ligne(
+        "SELECT id, nom_complet, email FROM utilisateurs WHERE id = ? AND role = 'UTILISATEUR'",
+        [Number(cle)]
+      );
+      if (!client) throw new Erreur("Compte client introuvable.");
+      qui = client.nom_complet + " (" + client.email + ")";
+    }
+    await tx.exec("INSERT INTO plafonds_envoi (type, cle, limite_jour, alerte_jour, motif, par, date_maj) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (type, cle) DO UPDATE SET limite_jour = EXCLUDED.limite_jour, alerte_jour = EXCLUDED.alerte_jour, motif = EXCLUDED.motif, par = EXCLUDED.par, date_maj = EXCLUDED.date_maj", [type, cle, limite, alerte, motif, acteur.id, t]);
+    await tx.exec("DELETE FROM alertes_envoi WHERE type = ? AND cle = ? AND jour = ?", [type, cle, debutJour(t)]);
+    const texteLimite = fdj(limite) + " par jour (alerte " + (alerte ? fdj(alerte) : "aucune") + ")";
+    await journaliser(tx, acteur.id, "LIMITE_ENVOI", "Limite d’envoi de " + qui + " : " + texteLimite + " — " + motif);
+    await tx.exec(
+      "INSERT INTO notifications (utilisateur_id, type, titre, message, lu, date_creation) SELECT id, 'LIMITE_RELEVEE', ?, ?, 0, ? FROM utilisateurs WHERE role = 'SUPER_ADMIN' AND statut = 'ACTIF' AND id <> ?",
+      ["Limite d’envoi modifiée : " + (client ? client.nom_complet : formatNumero(cle)), acteur.nom_complet + " a fixé la limite d’envoi de " + qui + " à " + texteLimite + ". Motif : " + motif, t, acteur.id]
+    );
+    if (client) {
+      await notifier(
+        tx,
+        client.id,
+        "LIMITE_RELEVEE",
+        "Limite d’envoi modifiée",
+        "Dj Wallet Exchange peut maintenant vous envoyer jusqu’à " + fdj(limite) + " par jour."
+      );
+    }
+  });
+}
+async function retirerPlafond(acteur, args) {
+  exigerRole(acteur, ["ADMIN", "SUPER_ADMIN"]);
+  const { type, cle } = lireEntite(args);
+  await transaction(async (tx) => {
+    const n = await tx.exec("DELETE FROM plafonds_envoi WHERE type = ? AND cle = ?", [type, cle]);
+    if (!n) return;
+    await journaliser(tx, acteur.id, "LIMITE_ENVOI", "Limite d’envoi générale rétablie pour " + (type === "COMPTE" ? "le compte n° " + cle : "le numéro " + formatNumero(cle)));
+  });
+}
+
 // src/walletApi.ts
 function referenceSimulee(w) {
   return w.code.substring(0, 4) + "-" + aleaHex(4).toUpperCase();
@@ -1592,8 +2245,8 @@ function versWallet(l) {
   l.logo = l.logo ? Buffer.from(l.logo).toString("base64") : null;
   return l;
 }
-async function walletParId(b, id, verrouiller = false) {
-  const l = await b.ligne("SELECT " + COLONNES + " FROM wallets WHERE id = ?" + (verrouiller ? " FOR UPDATE" : ""), [id]);
+async function walletParId(b, id, verrouiller2 = false) {
+  const l = await b.ligne("SELECT " + COLONNES + " FROM wallets WHERE id = ?" + (verrouiller2 ? " FOR UPDATE" : ""), [id]);
   return l ? versWallet(l) : null;
 }
 async function walletPourApi(b, id) {
@@ -1842,7 +2495,6 @@ var FENETRE_PAIEMENT_ANTERIEUR = 24 * 60 * MINUTE2;
 var DELAI_ORDRE = 4 * MINUTE2;
 var DELAI_ORDRE_NON_PRIS = 10 * MINUTE2;
 var TOLERANCE_AVANT_DEMANDE = 2 * MINUTE2;
-var DELAI_RECHERCHE_WAAFI = 2 * MINUTE2;
 var MAX_HISTORIQUES = 3;
 var ECART_HISTORIQUES = 30 * 1e3;
 var MAX_ESSAIS_LECTURE = 3;
@@ -1850,8 +2502,8 @@ var DELAI_RESOLUTION_ENVOI = 20 * MINUTE2;
 var DELAI_RELEVE_WAAFI = 3 * MINUTE2;
 var ALPHABET_CODE = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 var SELECTION_P = "SELECT d.id, d.reference, d.utilisateur_id, d.wallet_source_id, d.wallet_dest_id, d.numero_source, d.numero_dest, d.montant, d.montant_net, d.statut, d.etape_passerelle, d.paiement_verifie, d.ref_api_source, d.date_creation, d.date_confirmation, d.taux_commission, d.mode_dest, ws.nom AS source_nom, wd.nom AS dest_nom, ws.passerelle AS source_passerelle, wd.passerelle AS dest_passerelle, wd.mode_echange AS dest_mode, u.nom_complet AS client_nom FROM demandes_echange d JOIN wallets ws ON ws.id = d.wallet_source_id JOIN wallets wd ON wd.id = d.wallet_dest_id JOIN utilisateurs u ON u.id = d.utilisateur_id ";
-async function demandeP(b, id, verrouiller = false) {
-  if (verrouiller && !await b.ligne("SELECT id FROM demandes_echange WHERE id = ? FOR UPDATE", [id])) return null;
+async function demandeP(b, id, verrouiller2 = false) {
+  if (verrouiller2 && !await b.ligne("SELECT id FROM demandes_echange WHERE id = ? FOR UPDATE", [id])) return null;
   return b.ligne(SELECTION_P + "WHERE d.id = ?", [id]);
 }
 function propre(v, max) {
@@ -1873,17 +2525,28 @@ async function expediteursReconnus(b, operateur) {
   const v = await b.valeur("SELECT valeur FROM parametres WHERE cle = ?", ["passerelle_expediteurs_" + operateur.toLowerCase()]);
   return (v || expediteursParDefaut(operateur)).split(",").map(normaliserExpediteur).filter((x) => x.length > 0);
 }
-async function expediteurFiable(b, operateur, type, expediteur) {
+var TITRES_NOTIFICATION_DEFAUT = "WAAFI SAAS";
+async function titresNotification(b) {
+  const v = await b.valeur("SELECT valeur FROM parametres WHERE cle = ?", ["passerelle_titres_notification_waafi"]);
+  return (v || TITRES_NOTIFICATION_DEFAUT).split(",").map((x) => x.trim().toUpperCase().replace(/\s+/g, " ")).filter((x) => x.length >= 2);
+}
+function titreDe(texte2) {
+  return (texte2.split("\n")[0] || "").trim().substring(0, 100);
+}
+async function expediteurFiable(b, operateur, type, expediteur, texte2 = "") {
   if (type === "NOTIFICATION") {
     const paquet = expediteur.toLowerCase();
     if (!/^[a-z][a-z0-9_]*(\.[a-z0-9_]+)+$/.test(paquet)) return false;
-    return operateur === "WAAFI" ? paquet.indexOf("waafi") >= 0 : paquet.indexOf("dmoney") >= 0;
+    if (operateur === "DMONEY") return paquet.indexOf("dmoney") >= 0;
+    if (paquet.indexOf("waafi") < 0) return false;
+    const titre = normaliserExpediteur(titreDe(texte2));
+    return (await titresNotification(b)).map(normaliserExpediteur).indexOf(titre) >= 0;
   }
   return (await expediteursReconnus(b, operateur)).indexOf(normaliserExpediteur(expediteur)) >= 0;
 }
-async function walletDe(b, operateur, verrouiller = false) {
+async function walletDe(b, operateur, verrouiller2 = false) {
   return b.ligne(
-    "SELECT id, nom, mode_echange, seuil_alerte, solde_api, statut, compte_reception FROM wallets WHERE passerelle = ?" + (verrouiller ? " FOR UPDATE" : ""),
+    "SELECT id, nom, mode_echange, seuil_alerte, solde_api, statut, compte_reception FROM wallets WHERE passerelle = ?" + (verrouiller2 ? " FOR UPDATE" : ""),
     [operateur]
   );
 }
@@ -1909,22 +2572,28 @@ async function envoiEnCours(b, demandeId) {
   return !!await b.ligne("SELECT id FROM ordres_passerelle WHERE demande_id = ? AND type = 'ENVOI' AND statut = 'EN_COURS'", [demandeId]);
 }
 async function bloquer2(b, d, motif) {
-  const n = await b.exec(
-    "UPDATE demandes_echange SET etape_passerelle = 'BLOQUEE', motif_blocage = ?, date_blocage = ? WHERE id = ? AND statut = 'EN_COURS'",
-    [motif.substring(0, 500), Date.now(), d.id]
-  );
+  const n = await b.exec("UPDATE demandes_echange SET etape_passerelle = 'BLOQUEE', motif_blocage = ?, date_blocage = CASE WHEN etape_passerelle IN ('BLOQUEE', 'ATTENTE_ACCORD') AND date_blocage IS NOT NULL THEN date_blocage ELSE ? END, intervention_notifiee = CASE WHEN etape_passerelle IN ('BLOQUEE', 'ATTENTE_ACCORD') THEN intervention_notifiee ELSE 0 END WHERE id = ? AND statut = 'EN_COURS'", [motif.substring(0, 500), Date.now(), d.id]);
   if (!n) return;
   await annulerOrdresEnAttente(b, d.id);
-  await notifier(
-    b,
-    d.utilisateur_id,
-    "ECHANGE_BLOQUE",
-    "Échange en vérification",
-    "Votre échange " + d.reference + " est vérifié par un administrateur. Vous n’avez rien à faire : vous serez prévenu dès qu’il sera terminé.",
-    d.id
-  );
   await notifierAdmins(b, "ECHANGE_BLOQUE", "Échange bloqué : " + d.reference, motif.substring(0, 300), d.id);
   await journaliser(b, null, "PASSERELLE_BLOCAGE", d.reference + " : " + motif);
+}
+async function annoncerInterventions() {
+  const delai = (await chargerParametres()).passerelleDelaiInterventionMinutes * MINUTE2;
+  const lignes = await base().lignes(
+    "UPDATE demandes_echange SET intervention_notifiee = 1 WHERE statut = 'EN_COURS' AND etape_passerelle IN ('BLOQUEE', 'ATTENTE_ACCORD') AND intervention_notifiee = 0 AND date_blocage IS NOT NULL AND date_blocage <= ? RETURNING id, utilisateur_id, reference",
+    [Date.now() - delai]
+  );
+  for (const l of lignes) {
+    await notifier(
+      base(),
+      l.utilisateur_id,
+      "ECHANGE_INTERVENTION",
+      "Intervention d’un administrateur",
+      "Votre échange " + l.reference + " nécessite l’intervention d’un administrateur. Vous n’avez rien à faire : vous serez prévenu dès qu’il sera terminé.",
+      l.id
+    );
+  }
 }
 async function terminer(b, d, refDest) {
   const commission = d.taux_commission != null ? pourcentageDe(d.montant, d.taux_commission) : 0;
@@ -1940,9 +2609,17 @@ async function terminer(b, d, refDest) {
   );
   await journaliser(b, null, "PASSERELLE_ENVOI", "Demande " + d.reference + " : " + fdj(d.montant_net) + " envoyés par la passerelle au " + formatNumero(d.numero_dest) + " (" + d.dest_nom + ", ID " + refDest + ")");
 }
-async function lancerEnvoi(b, d) {
+async function lancerEnvoi(b, d, parAdmin = false) {
   if (!d.dest_passerelle) throw new Erreur("Le wallet " + d.dest_nom + " n’est pas géré par la passerelle.");
-  await b.exec("UPDATE demandes_echange SET etape_passerelle = 'ENVOI', motif_blocage = NULL, date_blocage = NULL WHERE id = ? AND statut = 'EN_COURS'", [d.id]);
+  const depasse = await depassementEnvoi(b, d);
+  if (depasse) {
+    const texte2 = texteDepassement(depasse, d.client_nom);
+    if (parAdmin) throw new Erreur("Envoi impossible : " + texte2 + ". Après vérification, relevez la limite (Limites d’envoi), puis réessayez.");
+    await noterEnvoiArrete(b, depasse);
+    await bloquer2(b, d, "Envoi arrêté, rien n’est parti : " + texte2 + ". Vérifiez l’échange ; si tout est en règle, relevez la limite (Limites d’envoi) puis relancez l’envoi ; sinon refusez la demande.");
+    return;
+  }
+  await b.exec("UPDATE demandes_echange SET etape_passerelle = 'ENVOI', motif_blocage = NULL, date_blocage = NULL, intervention_notifiee = 0 WHERE id = ? AND statut = 'EN_COURS'", [d.id]);
   await creerOrdre(b, "SOLDE", d.dest_passerelle, d.id, "AVANT_ENVOI");
 }
 async function raisonAccord(b, d) {
@@ -1976,7 +2653,10 @@ async function paiementProuve(b, d, op) {
 async function envoyerOuDemanderAccord(b, d, preuve) {
   const raison = await raisonAccord(b, d);
   if (raison) {
-    await b.exec("UPDATE demandes_echange SET etape_passerelle = 'ATTENTE_ACCORD', motif_blocage = ? WHERE id = ?", ["Accord requis : " + raison, d.id]);
+    await b.exec(
+      "UPDATE demandes_echange SET etape_passerelle = 'ATTENTE_ACCORD', motif_blocage = ?, date_blocage = ?, intervention_notifiee = 0 WHERE id = ?",
+      ["Accord requis : " + raison, Date.now(), d.id]
+    );
     await notifierAdmins(
       b,
       "ACCORD_REQUIS",
@@ -2040,20 +2720,11 @@ async function avancerVerification(b, d) {
     return;
   }
   const t = Date.now();
-  const debut = d.date_confirmation || d.date_creation;
   const ordres = await ordresDe(b, d.id);
   const enAttente = ordres.some((o) => o.statut === "A_FAIRE" || o.statut === "EN_COURS");
   const p = await rattacherPaiement(b, d);
   if (!p) {
-    const delai = (await chargerParametres(b)).passerelleDelaiPaiementMinutes;
-    if (t - debut > delai * MINUTE2) {
-      await verificationFinale(b, d, operateur, ordres, enAttente, delai);
-      return;
-    }
-    const recherches = ordres.filter((o) => o.motif === "RECHERCHE");
-    if (operateur === "WAAFI" && !enAttente && t - debut > DELAI_RECHERCHE_WAAFI && recherches.length < 2 && (!recherches.length || t - (recherches[recherches.length - 1].date_fin || 0) > 2 * MINUTE2) && !await b.ligne("SELECT id FROM ordres_passerelle WHERE operateur = 'WAAFI' AND type = 'HISTORIQUE' AND statut IN ('A_FAIRE', 'EN_COURS') LIMIT 1")) {
-      await creerOrdre(b, "HISTORIQUE", "WAAFI", d.id, "RECHERCHE");
-    }
+    await verifierSansMessage(b, d, operateur, ordres, t);
     return;
   }
   if (!p.confirme_operateur) {
@@ -2073,7 +2744,7 @@ async function avancerVerification(b, d) {
     }
     return;
   }
-  if (operateur === "WAAFI" && p.source !== "NOTIFICATION") {
+  if (operateur === "WAAFI") {
     const controles = ordres.filter((o) => o.motif === "CONTROLE_SOLDE");
     const fait = controles.find((o) => o.statut === "FAIT" && lireJson(o.resultat).coherent === true);
     if (!fait) {
@@ -2090,42 +2761,136 @@ async function avancerVerification(b, d) {
   }
   await paiementProuve(b, d, p);
 }
-async function verificationFinale(b, d, operateur, ordres, enAttente, delaiMinutes) {
-  const finales = ordres.filter((o) => o.motif === "CONTROLE_FINAL");
-  const f = finales[finales.length - 1];
-  if (!f || f.statut === "ECHEC") {
-    if (enAttente || finales.filter((o) => o.statut === "ECHEC").length >= MAX_ESSAIS_LECTURE) return;
-    await creerOrdre(b, "HISTORIQUE", operateur, d.id, "CONTROLE_FINAL");
+async function pointsSolde(b, operateur, condition, args, limite) {
+  const lignes = await b.lignes("SELECT type, resultat, date_prise, date_fin FROM ordres_passerelle WHERE operateur = ? AND statut = 'FAIT' AND type IN ('SOLDE', 'ENVOI') AND date_fin IS NOT NULL AND " + condition + " ORDER BY date_fin DESC, id DESC LIMIT " + limite, [operateur].concat(args));
+  const points = [];
+  for (const l of lignes) {
+    const r = lireJson(l.resultat);
+    const v = l.type === "SOLDE" ? r.solde : r.soldeEcran;
+    if (typeof v === "number" && isFinite(v)) points.push({ solde: v, debut: Number(l.date_prise || l.date_fin), quand: Number(l.date_fin) });
+  }
+  return points;
+}
+async function mouvementsACompter(b, operateur, apres, jusqua) {
+  const lignes = await b.lignes("SELECT sens, montant, date_mouvement FROM mouvements_solde WHERE operateur = ? AND date_mouvement > ? AND date_mouvement <= ? AND NOT (sens = 'ENTREE' AND operation_ref IS NOT NULL)", [operateur, apres, jusqua]);
+  return lignes.map((l) => ({ montant: (l.sens === "ENTREE" ? 1 : -1) * Number(l.montant), ts: Number(l.date_mouvement) }));
+}
+var MARGE_AVANT_LECTURE = 5e3;
+var MARGE_APRES_LECTURE = 2e4;
+var MAX_DOUTES = 8;
+async function ecartInexplique(b, operateur, avant, p) {
+  const references = await pointsSolde(b, operateur, "date_fin < ?", [avant], 3);
+  if (!references.length) return null;
+  const plusAncienne = references[references.length - 1];
+  const moment = "CASE WHEN source = 'ADMIN' AND date_operation IS NOT NULL THEN date_operation ELSE date_creation END";
+  const recus = await b.lignes(
+    "SELECT montant, " + moment + " AS ts FROM operations_operateur WHERE operateur = ? AND sens = 'RECU' AND montant IS NOT NULL AND NOT (source = 'RELEVE' AND date_operation IS NOT NULL AND date_operation < ?) AND " + moment + " > ? AND " + moment + " <= ?",
+    [operateur, plusAncienne.quand - 5 * MINUTE2, plusAncienne.debut - MARGE_AVANT_LECTURE, p.quand + MARGE_APRES_LECTURE]
+  );
+  const mouvements = await mouvementsACompter(b, operateur, plusAncienne.debut - MARGE_AVANT_LECTURE, p.quand + MARGE_APRES_LECTURE);
+  const douteuse = (ts, pt) => ts >= pt.debut - MARGE_AVANT_LECTURE && ts <= pt.quand + MARGE_APRES_LECTURE;
+  const reference = references.find((r) => !recus.some((o) => douteuse(Number(o.ts), r)) && !mouvements.some((o) => douteuse(o.ts, r))) || references[0];
+  const envois = await b.lignes("SELECT resultat FROM ordres_passerelle WHERE operateur = ? AND type = 'ENVOI' AND statut = 'FAIT' AND date_fin > ? AND date_fin <= ?", [operateur, reference.quand, p.quand]);
+  const envoye = envois.map((o) => lireJson(o.resultat).montantEcran).filter((m) => typeof m === "number" && isFinite(m)).reduce((x, m) => x + m, 0);
+  let sur = 0;
+  const doutes = [];
+  for (const o of recus.concat(mouvements)) {
+    const ts = Number(o.ts);
+    const montant = Number(o.montant);
+    if (douteuse(ts, reference) || douteuse(ts, p)) doutes.push(montant);
+    else if (ts > reference.quand && ts < p.debut) sur += montant;
+  }
+  const ecart = p.solde - (reference.solde + sur - envoye);
+  if (doutes.length > MAX_DOUTES) return [ecart, Number.NaN];
+  const valeurs = [];
+  for (let masque = 0; masque < 1 << doutes.length; masque++) {
+    let v = ecart;
+    doutes.forEach((m, i) => {
+      if (masque & 1 << i) v -= m;
+    });
+    if (valeurs.indexOf(v) < 0) valeurs.push(v);
+  }
+  return valeurs.sort((x, y) => x - y);
+}
+async function verifierSansMessage(b, d, operateur, ordres, t) {
+  const prm = await chargerParametres(b);
+  const debut = d.date_confirmation || d.date_creation;
+  const seuil = debut + prm.passerelleAttenteMessageSecondes * 1e3;
+  const finale = debut + prm.passerelleDelaiPaiementMinutes * MINUTE2;
+  if (t < seuil) return;
+  if (await signalerDoute(b, d, operateur)) return;
+  const estFinale = t >= finale;
+  const [point] = await pointsSolde(b, operateur, "date_fin >= ?", [estFinale ? finale : seuil], 1);
+  if (!point) {
+    if (await b.ligne("SELECT id FROM ordres_passerelle WHERE operateur = ? AND type = 'SOLDE' AND statut IN ('A_FAIRE', 'EN_COURS') LIMIT 1", [operateur])) return;
+    const motif = estFinale ? "CONTROLE_FINAL" : "CONTROLE_RECEPTION";
+    const memes = ordres.filter((o) => o.type === "SOLDE" && o.motif === motif);
+    if (!estFinale && memes.some((o) => o.statut === "FAIT")) return;
+    if (memes.filter((o) => o.statut === "ECHEC").length >= MAX_ESSAIS_LECTURE) return;
+    await creerOrdre(b, "SOLDE", operateur, d.id, motif);
     return;
   }
-  if (f.statut !== "FAIT") return;
-  const r = lireJson(f.resultat);
   const quoi = fdj(d.montant) + " du " + formatNumero(d.numero_source);
-  if (operateur === "WAAFI" && !r.releve) {
-    if (Date.now() - (f.date_fin || 0) < DELAI_RELEVE_WAAFI) return;
-    await bloquer2(b, d, "Paiement introuvable (" + quoi + ") et mini-relevé Waafi non reçu lors de la vérification finale : vérifiez sur le téléphone passerelle, puis validez le paiement ou refusez la demande.");
+  const valeurs = await ecartInexplique(b, operateur, d.date_creation, point);
+  if (valeurs == null) {
+    if (estFinale) {
+      await bloquer2(b, d, "Aucun SMS ni notification de " + nomOperateur(operateur) + " pour ce paiement (" + quoi + "), et aucun solde lu à l’écran avant la demande pour comparer : vérifiez le paiement sur le téléphone passerelle, puis validez-le ou refusez la demande.");
+    }
     return;
   }
+  if (valeurs.length === 1 && valeurs[0] === 0) {
+    if (estFinale) await conclureSansPaiement(b, d, operateur, prm.passerelleDelaiPaiementMinutes);
+    return;
+  }
+  if (valeurs.indexOf(0) >= 0) {
+    if (!estFinale) return;
+    const finales = ordres.filter((o) => o.type === "SOLDE" && o.motif === "CONTROLE_FINAL" && o.statut === "FAIT").length;
+    if (finales < 2) {
+      if (!await b.ligne("SELECT id FROM ordres_passerelle WHERE operateur = ? AND type = 'SOLDE' AND statut IN ('A_FAIRE', 'EN_COURS') LIMIT 1", [operateur])) {
+        await creerOrdre(b, "SOLDE", operateur, d.id, "CONTROLE_FINAL");
+      }
+      return;
+    }
+    await bloquer2(b, d, "Aucun SMS ni notification pour ce paiement (" + quoi + ") ; le solde " + nomOperateur(operateur) + " lu à l’écran ne permet pas de conclure avec certitude (paiements d’autres clients arrivés pendant les lectures). Vérifiez sur le téléphone passerelle, puis validez le paiement ou refusez la demande.");
+    return;
+  }
+  const ecart = valeurs.reduce((m, v) => isNaN(m) || Math.abs(v) < Math.abs(m) ? v : m, Number.NaN);
+  if (isNaN(ecart)) {
+    await bloquer2(b, d, "Solde " + nomOperateur(operateur) + " impossible à interpréter (trop d’opérations pendant les lectures) : vérifiez le paiement de " + quoi + " sur le téléphone passerelle, puis validez-le ou refusez la demande.");
+    return;
+  }
+  if (ecart >= d.montant) {
+    await bloquer2(b, d, "Aucun SMS ni notification de " + nomOperateur(operateur) + " pour ce paiement, mais le solde lu à l’écran (" + fdj(point.solde) + ") a augmenté de " + fdj(ecart) + " sans message : le paiement de " + quoi + " est peut-être arrivé sans avis. Vérifiez sur le téléphone passerelle, puis validez le paiement ou refusez la demande.");
+    return;
+  }
+  await bloquer2(b, d, "Solde " + nomOperateur(operateur) + " incohérent : " + fdj(point.solde) + " lu à l’écran, écart inexpliqué de " + (ecart > 0 ? "+" : "−") + fdj(Math.abs(ecart)) + " par rapport aux opérations connues (paiement attendu : " + quoi + "). Vérifiez sur le téléphone passerelle, puis validez le paiement ou refusez la demande.");
+}
+async function signalerDoute(b, d, operateur) {
+  const quoi = fdj(d.montant) + " du " + formatNumero(d.numero_source);
   const anterieur = await b.ligne(
     "SELECT * FROM operations_operateur WHERE operateur = ? AND sens = 'RECU' AND demande_id IS NULL AND utilisee = 0 AND montant = ? AND numero = ? AND date_creation > ? ORDER BY id DESC LIMIT 1",
     [operateur, d.montant, d.numero_source, Date.now() - FENETRE_PAIEMENT_ANTERIEUR]
   );
   if (anterieur) {
     await bloquer2(b, d, "Un paiement " + nomOperateur(operateur) + " de " + quoi + " (ID " + anterieur.operation_id + ") est arrivé avant la demande : vérifiez qu’il correspond bien à cet échange, puis validez le paiement ou refusez la demande.");
-    return;
+    return true;
   }
   const autre = await paiementAutreNumero(b, d, operateur);
   if (autre) {
     await bloquer2(b, d, "Un paiement " + nomOperateur(operateur) + " de " + fdj(d.montant) + " (ID " + autre.operation_id + ") est arrivé du " + formatNumero(autre.numero) + ", et non du " + formatNumero(d.numero_source) + " indiqué dans la demande : vérifiez auprès du client, puis validez le paiement ou refusez la demande.");
-    return;
+    return true;
   }
   if (operateur === "DMONEY") {
     const inconnue = await b.ligne("SELECT * FROM operations_operateur WHERE operateur = 'DMONEY' AND sens IS NULL AND demande_id IS NULL AND montant = ? AND date_operation >= ? ORDER BY id DESC LIMIT 1", [d.montant, d.date_creation - 30 * MINUTE2]);
     if (inconnue) {
       await bloquer2(b, d, "Aucun SMS de paiement, mais une opération de " + fdj(d.montant) + " (ID " + inconnue.operation_id + ") apparaît dans l’historique D-Money : vérifiez sur le téléphone passerelle si elle vient du " + formatNumero(d.numero_source) + ", puis validez le paiement ou refusez la demande.");
-      return;
+      return true;
     }
   }
+  return false;
+}
+async function conclureSansPaiement(b, d, operateur, delaiMinutes) {
+  if (await signalerDoute(b, d, operateur)) return;
   await refuserSansPaiement(b, d, operateur, delaiMinutes);
 }
 async function paiementAutreNumero(b, d, operateur) {
@@ -2136,7 +2901,7 @@ async function refuserSansPaiement(b, d, operateur, delaiMinutes) {
   if (!n) return;
   await annulerOrdresEnAttente(b, d.id);
   await notifier(b, d.utilisateur_id, "ECHANGE_REFUSE", "Demande refusée", "Votre demande " + d.reference + " a été refusée. Motif : " + MOTIF_NON_RECU + " (aucun paiement de " + fdj(d.montant) + " reçu du " + formatNumero(d.numero_source) + " sur " + d.source_nom + ").", d.id);
-  await notifierAdmins(b, "PASSERELLE_INFO", "Refus automatique : " + d.reference, d.client_nom + " a confirmé sans paiement : aucun paiement " + nomOperateur(operateur) + " de " + fdj(d.montant) + " du " + formatNumero(d.numero_source) + " en " + delaiMinutes + " minutes, ni dans l’historique de l’opérateur. Demande refusée (paiement non reçu).", d.id);
+  await notifierAdmins(b, "PASSERELLE_INFO", "Refus automatique : " + d.reference, d.client_nom + " a confirmé sans paiement : aucun SMS ni notification " + nomOperateur(operateur) + " de " + fdj(d.montant) + " du " + formatNumero(d.numero_source) + " en " + delaiMinutes + " minute" + (delaiMinutes > 1 ? "s" : "") + ", et solde lu à l’écran inchangé. Demande refusée (paiement non reçu).", d.id);
   await journaliser(b, null, "REFUS_AUTOMATIQUE", "Demande " + d.reference + " refusée automatiquement : " + MOTIF_NON_RECU + " (" + fdj(d.montant) + " du " + formatNumero(d.numero_source) + ", " + nomOperateur(operateur) + ")");
 }
 async function signalerPaiementTardif(b, op) {
@@ -2164,20 +2929,29 @@ async function traiterMessage(passerelleId, m) {
       await b.exec("UPDATE messages_passerelle SET nature = 'IGNORE', lecture = ? WHERE id = ?", [a2.resume, id]);
       return;
     }
-    if (!await expediteurFiable(b, a2.operateur, m.type, m.expediteur)) {
+    const titre = m.type === "NOTIFICATION" ? titreDe(m.texte) : null;
+    if (titre) await b.exec("UPDATE messages_passerelle SET titre = ? WHERE id = ?", [titre, id]);
+    if (!await expediteurFiable(b, a2.operateur, m.type, m.expediteur, m.texte)) {
+      const discussion = m.type === "NOTIFICATION" && a2.operateur === "WAAFI" && m.expediteur.toLowerCase().indexOf("waafi") >= 0;
       await b.exec(
         "UPDATE messages_passerelle SET operateur = ?, nature = 'NON_FIABLE', lecture = ? WHERE id = ?",
-        [a2.operateur, "Expéditeur non reconnu : " + a2.resume, id]
+        [a2.operateur, (discussion ? "Notification Waafi d’un autre expéditeur que « WAAFI SAAS » (« " + (titre || "?") + " ») : " : "Expéditeur non reconnu : ") + a2.resume, id]
       );
       if (a2.operations.length) {
-        await notifierAdmins(
-          b,
-          "PASSERELLE_ALERTE",
-          "Message suspect ignoré",
-          "Un message qui ressemble à " + nomOperateur(a2.operateur) + " est arrivé de « " + m.expediteur.substring(0, 40) + " » (" + a2.resume + "). Il est ignoré. Si c’est bien l’opérateur, ajoutez cet expéditeur dans l’écran Passerelle."
-        );
+        await notifierAdmins(b, "PASSERELLE_ALERTE", "Message suspect ignoré", discussion ? "Une notification de l’application Waafi venue de « " + (titre || "?").substring(0, 40) + " » (et non de WAAFI SAAS) ressemble à un reçu (" + a2.resume + ") : c’est peut-être un message de discussion qui imite un reçu. Il est ignoré." : "Un message qui ressemble à " + nomOperateur(a2.operateur) + " est arrivé de « " + m.expediteur.substring(0, 40) + " » (" + a2.resume + "). Il est ignoré. Si c’est bien l’opérateur, ajoutez cet expéditeur dans l’écran Passerelle.");
       }
       return;
+    }
+    if (a2.nature === "RELEVE" && a2.operateur === "WAAFI") {
+      const problemes = await controlerReleve(b, a2.operations);
+      if (problemes.length) {
+        await b.exec(
+          "UPDATE messages_passerelle SET operateur = ?, nature = 'DOUTEUX', lecture = ? WHERE id = ?",
+          [a2.operateur, "Mini-relevé douteux : " + problemes.join(" ; ").substring(0, 400), id]
+        );
+        if (!await releveDejaDouteux(b, sha256Hex(m.texte))) await signalerReleveDouteux(b, problemes);
+        return;
+      }
     }
     await b.exec("UPDATE messages_passerelle SET operateur = ?, nature = ?, lecture = ? WHERE id = ?", [a2.operateur, a2.nature, a2.resume, id]);
     const source = m.type === "NOTIFICATION" ? "NOTIFICATION" : a2.nature === "RELEVE" ? "RELEVE" : "SMS";
@@ -2191,11 +2965,41 @@ async function traiterMessage(passerelleId, m) {
     if (a2.nature === "ENVOI") for (const o of a2.operations) await resoudreEnvoiIncertain(b, o);
   });
 }
+async function controlerReleve(b, ops) {
+  const depuis = Number(await b.valeur("SELECT MIN(date_association) AS d FROM passerelles WHERE actif = 1")) || 0;
+  const problemes = [];
+  for (const o of ops) {
+    const x = await b.ligne("SELECT * FROM operations_operateur WHERE operateur = ? AND operation_id = ?", [o.operateur, o.operationId]);
+    if (!x) {
+      if (o.date != null && o.date < depuis) continue;
+      problemes.push("opération inconnue ID " + o.operationId + (o.montant != null ? " (" + fdj(o.montant) + ")" : ""));
+      continue;
+    }
+    const different = o.montant != null && x.montant != null && Number(o.montant) !== Number(x.montant) || !!o.sens && !!x.sens && o.sens !== x.sens || !!o.numero && !!x.numero && o.numero !== x.numero;
+    if (different) problemes.push("ID " + o.operationId + " différent de l’opération connue");
+  }
+  return problemes;
+}
+async function signalerReleveDouteux(b, problemes) {
+  await notifierAdmins(b, "PASSERELLE_ALERTE", "Mini-relevé Waafi douteux", "Un mini-relevé Waafi contient des lignes qui ne correspondent à aucune opération connue (" + problemes.slice(0, 3).join(" ; ") + "). Il est ignoré : il est peut-être faux. Vérifiez le relevé sur le téléphone passerelle.");
+  await journaliser(b, null, "PASSERELLE_RELEVE_DOUTEUX", problemes.join(" ; ").substring(0, 500));
+  const ids = await b.lignes("SELECT d.id FROM demandes_echange d JOIN operations_operateur o ON o.demande_id = d.id AND o.role = 'PAIEMENT' WHERE d.statut = 'EN_COURS' AND d.etape_passerelle = 'VERIF_PAIEMENT' AND o.operateur = 'WAAFI' AND o.confirme_operateur IS NULL ORDER BY d.id");
+  for (const { id } of ids) {
+    const d = await demandeP(b, id, true);
+    if (d) {
+      await bloquer2(b, d, "Mini-relevé Waafi douteux (" + problemes.slice(0, 2).join(" ; ") + ") : le paiement n’a pas pu être prouvé. Vérifiez le relevé et le solde sur le téléphone passerelle, puis validez le paiement ou refusez la demande.");
+    }
+  }
+}
+async function releveDejaDouteux(b, empreinte) {
+  const lignes = await b.lignes("SELECT resultat FROM ordres_passerelle WHERE operateur = 'WAAFI' AND type = 'HISTORIQUE' AND statut = 'FAIT' AND date_fin >= ? ORDER BY id DESC LIMIT 5", [Date.now() - DELAI_RELEVE_WAAFI]);
+  return lignes.some((l) => lireJson(l.resultat).releveDouteux === empreinte);
+}
 async function rattacherReleveWaafi(b, ops) {
   const ordre = await b.ligne("SELECT * FROM ordres_passerelle WHERE operateur = 'WAAFI' AND type = 'HISTORIQUE' AND statut = 'FAIT' AND date_fin >= ? ORDER BY id DESC LIMIT 1 FOR UPDATE", [Date.now() - DELAI_RELEVE_WAAFI]);
   if (!ordre) return;
   const r = lireJson(ordre.resultat);
-  if (r.releve) return;
+  if (r.releve || r.releveDouteux) return;
   for (const o of ops) await enregistrerOperation(b, o, "RELEVE", true);
   r.releve = true;
   await b.exec("UPDATE ordres_passerelle SET resultat = ? WHERE id = ?", [JSON.stringify(r), ordre.id]);
@@ -2318,6 +3122,14 @@ async function traiterResultat(r) {
           if (!await expediteurFiable(b, "WAAFI", "SMS", s2.expediteur)) continue;
           const ops = lireReleveWaafi(s2.texte);
           if (!ops.length) continue;
+          const problemes = await controlerReleve(b, ops);
+          if (problemes.length) {
+            resultat.releveDouteux = sha256Hex(s2.texte);
+            resultat.problemes = problemes;
+            await terminerOrdre(b, ordre, "FAIT", resultat, null);
+            await signalerReleveDouteux(b, problemes);
+            return;
+          }
           for (const o of ops) await enregistrerOperation(b, o, "RELEVE", true);
           resultat.releve = true;
           resultat.operations = ops.map((o) => o.operationId);
@@ -2376,13 +3188,15 @@ async function soldeAttendu(b, operateur, ordreId, p) {
     }
   }
   if (base2 == null || p.montant == null) return null;
+  const moment = "CASE WHEN source = 'ADMIN' AND date_operation IS NOT NULL THEN date_operation ELSE date_creation END";
   const recus = Number(await b.valeur(
-    "SELECT COALESCE(SUM(montant), 0) AS s FROM operations_operateur WHERE operateur = ? AND sens = 'RECU' AND montant IS NOT NULL AND id <> ? AND date_creation > ? AND NOT (source = 'RELEVE' AND date_operation IS NOT NULL AND date_operation < ?)",
+    "SELECT COALESCE(SUM(montant), 0) AS s FROM operations_operateur WHERE operateur = ? AND sens = 'RECU' AND montant IS NOT NULL AND id <> ? AND " + moment + " > ? AND NOT (source = 'RELEVE' AND date_operation IS NOT NULL AND date_operation < ?)",
     [operateur, p.id, quand, quand - 5 * MINUTE2]
   ));
   const envois = await b.lignes("SELECT resultat FROM ordres_passerelle WHERE operateur = ? AND type = 'ENVOI' AND statut = 'FAIT' AND date_fin > ?", [operateur, quand]);
   const envoye = envois.map((o) => lireJson(o.resultat).montantEcran).filter((m) => typeof m === "number" && isFinite(m)).reduce((s2, m) => s2 + m, 0);
-  return base2 + Number(p.montant) + recus - envoye;
+  const ajustements = (await mouvementsACompter(b, operateur, quand, Number.MAX_SAFE_INTEGER)).reduce((s2, m) => s2 + m.montant, 0);
+  return base2 + Number(p.montant) + recus - envoye + ajustements;
 }
 async function echecLecture(b, ordre, resultat, erreur, d) {
   await terminerOrdre(b, ordre, "ECHEC", resultat, erreur);
@@ -2439,6 +3253,11 @@ async function unPassage() {
     await expirerOrdres();
   } catch (e) {
     console.error("[passerelle] délais des ordres :", e && e.message);
+  }
+  try {
+    await annoncerInterventions();
+  } catch (e) {
+    console.error("[passerelle] interventions :", e && e.message);
   }
   const ids = await base().lignes("SELECT id FROM demandes_echange WHERE statut = 'EN_COURS' AND etape_passerelle = 'VERIF_PAIEMENT' ORDER BY id");
   for (const { id } of ids) {
@@ -2570,7 +3389,8 @@ async function synchroniser(passerelleId, args) {
     acquittes,
     resultatsAcquittes,
     ordres: ordre ? [{ id: ordre.id, type: ordre.type, operateur: ordre.operateur, montant: ordre.montant, numero: ordre.numero }] : [],
-    prochainAppel: actif ? 10 : 60
+    prochainAppel: actif ? 10 : 60,
+    reglages: { titresNotification: await titresNotification(base()) }
   };
 }
 async function commencerVerification(b, demandeId) {
@@ -2580,7 +3400,7 @@ async function envoyerApresAttestation(b, demandeId) {
   const d = await demandeP(b, demandeId);
   if (!d) throw new Erreur("Demande introuvable.");
   await b.exec("UPDATE demandes_echange SET paiement_verifie = CASE WHEN paiement_verifie = 0 THEN 2 ELSE paiement_verifie END WHERE id = ?", [d.id]);
-  await lancerEnvoi(b, d);
+  await lancerEnvoi(b, d, true);
 }
 async function demandeAdmin(b, args) {
   const id = entier(args.id, "demande", 1);
@@ -2601,7 +3421,7 @@ async function autoriserEnvoi(acteur, args) {
     if (envois.some((o) => o.statut === "INCERTAIN" || o.statut === "FAIT") && !booleen(args.verifie)) {
       throw new Erreur("Un envoi a peut-être déjà eu lieu : vérifiez l’historique " + d.dest_nom + " et confirmez que l’argent n’est pas parti.");
     }
-    await lancerEnvoi(b, d);
+    await lancerEnvoi(b, d, true);
     await journaliser(b, acteur.id, "PASSERELLE_ACCORD", "Envoi automatique autorisé pour la demande " + d.reference + " (" + fdj(d.montant_net) + ")");
   });
   declencher();
@@ -2613,7 +3433,7 @@ async function validerPaiement(acteur, args) {
     if (d.paiement_verifie) throw new Erreur("Le paiement est déjà vérifié.");
     if (d.etape_passerelle !== "VERIF_PAIEMENT" && d.etape_passerelle !== "BLOQUEE") throw new Erreur("Action impossible à cette étape.");
     await annulerOrdresEnAttente(b, d.id);
-    const op = await paiementLibre(b, d);
+    const op = await paiementSaisi(b, d, args.refOperateur) || await paiementLibre(b, d);
     if (op) {
       await b.exec("UPDATE operations_operateur SET demande_id = ?, role = 'PAIEMENT', utilisee = 1, sens = COALESCE(sens, 'RECU'), numero = COALESCE(numero, ?) WHERE id = ? AND demande_id IS NULL", [d.id, d.numero_source, op.id]);
       await b.exec("UPDATE demandes_echange SET paiement_verifie = 2, ref_api_source = ? WHERE id = ?", [op.operation_id, d.id]);
@@ -2628,6 +3448,24 @@ async function validerPaiement(acteur, args) {
     }
   });
   declencher();
+}
+async function paiementSaisi(b, d, brut) {
+  const ref = texte(brut, "identifiant de la transaction", 40).replace(/\s+/g, "");
+  if (!ref) return null;
+  if (!/^[A-Za-z0-9-]{4,30}$/.test(ref)) throw new Erreur("L’identifiant de la transaction est invalide.");
+  if (!d.source_passerelle) return null;
+  const x = await b.ligne("SELECT * FROM operations_operateur WHERE operateur = ? AND operation_id = ? FOR UPDATE", [d.source_passerelle, ref]);
+  if (x) {
+    if (x.sens === "ENVOYE") throw new Erreur("L’identifiant " + ref + " est celui d’un envoi du service, pas d’un paiement reçu.");
+    if (x.demande_id || x.utilisee) throw new Erreur("L’identifiant " + ref + " a déjà servi pour une autre demande.");
+    if (x.montant != null && Number(x.montant) !== d.montant) {
+      throw new Erreur("L’identifiant " + ref + " correspond à " + fdj(Number(x.montant)) + ", et non à " + fdj(d.montant) + ".");
+    }
+    return x;
+  }
+  const t = Date.now();
+  await b.exec("INSERT INTO operations_operateur (operateur, operation_id, sens, montant, numero, date_operation, source, confirme_operateur, utilisee, date_creation) VALUES (?, ?, 'RECU', ?, ?, ?, 'ADMIN', ?, 0, ?)", [d.source_passerelle, ref, d.montant, d.numero_source, d.date_creation, t, t]);
+  return b.ligne("SELECT * FROM operations_operateur WHERE operateur = ? AND operation_id = ?", [d.source_passerelle, ref]);
 }
 async function paiementLibre(b, d) {
   if (!d.source_passerelle) return null;
@@ -2656,10 +3494,11 @@ async function etat(acteur) {
   const wallets = await b.lignes("SELECT id, nom, passerelle, statut, mode_echange, type_compte, compte_reception, solde_api, solde_maj FROM wallets ORDER BY ordre, id");
   const ordres = await b.lignes("SELECT o.id, o.type, o.operateur, o.motif, o.montant, o.numero, o.statut, o.tentatives, o.erreur, o.date_creation, o.date_prise, o.date_fin, d.reference FROM ordres_passerelle o LEFT JOIN demandes_echange d ON d.id = o.demande_id ORDER BY o.id DESC LIMIT 20");
   const operations = await b.lignes("SELECT o.id, o.operateur, o.operation_id, o.sens, o.montant, o.numero, o.nom, o.date_operation, o.solde_apres, o.source, o.confirme_operateur, o.role, o.utilisee, o.date_creation, d.reference FROM operations_operateur o LEFT JOIN demandes_echange d ON d.id = o.demande_id ORDER BY o.id DESC LIMIT 30");
-  const messages = await b.lignes("SELECT id, type, expediteur, operateur, nature, lecture, recu_a, date_reception FROM messages_passerelle ORDER BY id DESC LIMIT 20");
+  const messages = await b.lignes("SELECT id, type, expediteur, titre, operateur, nature, lecture, recu_a, date_reception FROM messages_passerelle ORDER BY id DESC LIMIT 20");
   const expediteurs = {
     DMONEY: (await expediteursReconnus(b, "DMONEY")).join(", "),
-    WAAFI: (await expediteursReconnus(b, "WAAFI")).join(", ")
+    WAAFI: (await expediteursReconnus(b, "WAAFI")).join(", "),
+    NOTIFICATION_WAAFI: (await titresNotification(b)).join(", ")
   };
   return {
     passerelle: p ? {
@@ -2716,6 +3555,18 @@ async function ordreEssai(acteur, args) {
 }
 async function reglerExpediteurs(acteur, args) {
   exigerRole(acteur, ["SUPER_ADMIN"]);
+  if (args.type === "NOTIFICATION") {
+    const titres = texte(args.expediteurs, "expéditeurs", 200).split(",").map((x) => x.trim().toUpperCase().replace(/\s+/g, " ")).filter((x) => normaliserExpediteur(x).length >= 2);
+    if (!titres.length) throw new Erreur("Indiquez au moins un expéditeur de notification (par exemple " + TITRES_NOTIFICATION_DEFAUT + ").");
+    await transaction(async (b) => {
+      await b.exec(
+        "INSERT INTO parametres (cle, valeur, description) VALUES (?, ?, ?) ON CONFLICT (cle) DO UPDATE SET valeur = EXCLUDED.valeur",
+        ["passerelle_titres_notification_waafi", titres.join(","), "Passerelle : expéditeurs des notifications officielles de l’application Waafi"]
+      );
+      await journaliser(b, acteur.id, "PASSERELLE_EXPEDITEURS", "Waafi : notifications reconnues de " + titres.join(", "));
+    });
+    return;
+  }
   const operateur = parmi(args.operateur, ["DMONEY", "WAAFI"], "opérateur");
   const liste = texte(args.expediteurs, "expéditeurs", 200).split(",").map(normaliserExpediteur).filter((x) => x.length >= 2);
   if (!liste.length) throw new Erreur("Indiquez au moins un expéditeur (par exemple " + expediteursParDefaut(operateur) + ").");
@@ -2735,12 +3586,23 @@ async function actualiserSoldes(b, operateurs) {
 }
 
 // src/demandes.ts
-var SELECTION = "SELECT d.id AS id, d.reference AS reference, d.utilisateur_id AS utilisateur_id, d.wallet_source_id AS wallet_source_id, d.wallet_dest_id AS wallet_dest_id, d.numero_source AS numero_source, d.numero_dest AS numero_dest, d.montant AS montant, d.frais AS frais, d.frais_systeme AS frais_systeme, d.montant_net AS montant_net, d.libelle_frais AS libelle_frais, d.mode_source AS mode_source, d.mode_dest AS mode_dest, d.statut AS statut, d.paiement_verifie AS paiement_verifie, d.ref_api_source AS ref_api_source, d.ref_api_dest AS ref_api_dest, d.motif_refus AS motif_refus, d.traite_par AS traite_par, d.date_creation AS date_creation, d.date_confirmation AS date_confirmation, d.date_traitement AS date_traitement, d.nom_beneficiaire AS nom_beneficiaire, d.commission AS commission, d.taux_commission AS taux_commission, d.etape_passerelle AS etape_passerelle, d.motif_blocage AS motif_blocage, d.date_blocage AS date_blocage, ws.nom AS source_nom, wd.nom AS dest_nom, u.nom_complet AS client_nom, u.email AS client_email, a.nom_complet AS admin_nom, (SELECT COUNT(*) FROM preuves_transaction p WHERE p.demande_id = d.id) AS a_preuve, (SELECT COUNT(*) FROM signalements sg WHERE sg.demande_id = d.id AND sg.statut <> 'TRAITE') AS signalement_ouvert FROM demandes_echange d JOIN wallets ws ON ws.id = d.wallet_source_id JOIN wallets wd ON wd.id = d.wallet_dest_id JOIN utilisateurs u ON u.id = d.utilisateur_id LEFT JOIN utilisateurs a ON a.id = d.traite_par ";
+var SELECTION = "SELECT d.id AS id, d.reference AS reference, d.utilisateur_id AS utilisateur_id, d.wallet_source_id AS wallet_source_id, d.wallet_dest_id AS wallet_dest_id, d.numero_source AS numero_source, d.numero_dest AS numero_dest, d.montant AS montant, d.frais AS frais, d.frais_systeme AS frais_systeme, d.montant_net AS montant_net, d.libelle_frais AS libelle_frais, d.mode_source AS mode_source, d.mode_dest AS mode_dest, d.statut AS statut, d.paiement_verifie AS paiement_verifie, d.ref_api_source AS ref_api_source, d.ref_api_dest AS ref_api_dest, d.motif_refus AS motif_refus, d.traite_par AS traite_par, d.date_creation AS date_creation, d.date_confirmation AS date_confirmation, d.date_traitement AS date_traitement, d.nom_beneficiaire AS nom_beneficiaire, d.commission AS commission, d.taux_commission AS taux_commission, d.etape_passerelle AS etape_passerelle, d.motif_blocage AS motif_blocage, d.date_blocage AS date_blocage, d.montant_rembourse AS montant_rembourse, d.date_remboursement AS date_remboursement, ws.nom AS source_nom, wd.nom AS dest_nom, u.nom_complet AS client_nom, u.email AS client_email, a.nom_complet AS admin_nom, (SELECT COUNT(*) FROM preuves_transaction p WHERE p.demande_id = d.id) AS a_preuve, (SELECT COUNT(*) FROM signalements sg WHERE sg.demande_id = d.id AND sg.statut <> 'TRAITE') AS signalement_ouvert FROM demandes_echange d JOIN wallets ws ON ws.id = d.wallet_source_id JOIN wallets wd ON wd.id = d.wallet_dest_id JOIN utilisateurs u ON u.id = d.utilisateur_id LEFT JOIN utilisateurs a ON a.id = d.traite_par ";
 var STATUTS = ["EN_ATTENTE", "EN_COURS", "TRAITEE", "ANNULEE", "REFUSEE"];
-var ETAPES = ["VERIF_PAIEMENT", "ATTENTE_ACCORD", "ENVOI", "BLOQUEE"];
-function pourActeur(acteur, d) {
-  if (d && !estAdmin(acteur)) d.motif_blocage = null;
+var ETAPES = ["VERIF_PAIEMENT", "ATTENTE_ACCORD", "ENVOI", "BLOQUEE", "INTERVENTION"];
+function vueClient(d, delaiIntervention, t) {
+  d.motif_blocage = null;
+  const e = d.etape_passerelle;
+  if (d.statut === "EN_COURS" && (e === "BLOQUEE" || e === "ATTENTE_ACCORD")) {
+    const depuis = d.date_blocage != null ? Number(d.date_blocage) : t;
+    d.etape_passerelle = t - depuis >= delaiIntervention ? "INTERVENTION" : d.paiement_verifie ? "ENVOI" : "VERIF_PAIEMENT";
+  }
+  d.date_blocage = null;
   return d;
+}
+async function pourActeur(acteur, d) {
+  if (!d || estAdmin(acteur)) return d;
+  const delai = (await chargerParametres()).passerelleDelaiInterventionMinutes * 6e4;
+  return vueClient(d, delai, Date.now());
 }
 async function listerDemandes(acteur, brut, b = base()) {
   const f = brut == null ? {} : objet(brut, "filtre");
@@ -2757,12 +3619,13 @@ async function listerDemandes(acteur, brut, b = base()) {
     conditions.push("d.statut IN (" + marques(statuts.length) + ")");
     statuts.forEach((s2) => args.push(s2));
   }
-  const etapes = tableau(f.etapes, "étapes", 4).map((s2) => parmi(s2, ETAPES, "étape"));
-  if (etapes.length) {
+  const etapes = tableau(f.etapes, "étapes", 5).map((s2) => parmi(s2, ETAPES, "étape"));
+  const admin = estAdmin(acteur);
+  if (etapes.length && admin) {
     conditions.push("d.etape_passerelle IN (" + marques(etapes.length) + ")");
     etapes.forEach((s2) => args.push(s2));
   }
-  if (f.horsEtapes === true) conditions.push("(d.etape_passerelle IS NULL OR d.etape_passerelle NOT IN ('ATTENTE_ACCORD', 'BLOQUEE'))");
+  if (f.horsEtapes === true && admin) conditions.push("(d.etape_passerelle IS NULL OR d.etape_passerelle NOT IN ('ATTENTE_ACCORD', 'BLOQUEE'))");
   const col = f.colonneDate === "date_traitement" ? "d.date_traitement" : "d.date_creation";
   const debut = entierOuNull(f.debut, "début de période", 0);
   const fin = entierOuNull(f.fin, "fin de période", 0);
@@ -2791,7 +3654,10 @@ async function listerDemandes(acteur, brut, b = base()) {
   const limite = Math.max(1, Math.min(2e3, Math.floor(entierOuNull(f.limite, "limite", 1, 1e5) || 300)));
   args.push(limite);
   const lignes = await b.lignes(SELECTION + (conditions.length ? "WHERE " + conditions.join(" AND ") + " " : "") + "ORDER BY " + ordre + " LIMIT ?", args);
-  return lignes.map((d) => pourActeur(acteur, d));
+  if (admin) return lignes;
+  const delai = (await chargerParametres()).passerelleDelaiInterventionMinutes * 6e4;
+  const t = Date.now();
+  return lignes.map((d) => vueClient(d, delai, t)).filter((d) => (!etapes.length || d.etape_passerelle != null && etapes.indexOf(d.etape_passerelle) >= 0) && (f.horsEtapes !== true || d.etape_passerelle !== "INTERVENTION"));
 }
 async function demandeParId(b, id) {
   return b.ligne(SELECTION + "WHERE d.id = ?", [id]);
@@ -2805,7 +3671,7 @@ async function lireDemande(acteur, args) {
   const id = entier(args.id, "demande", 1);
   const d = await demandeParId(base(), id);
   if (!d || !estAdmin(acteur) && d.utilisateur_id !== acteur.id) return null;
-  return pourActeur(acteur, d);
+  return await pourActeur(acteur, d);
 }
 async function preuveDe(acteur, args) {
   const id = entier(args.id, "demande", 1);
@@ -2816,17 +3682,22 @@ async function preuveDe(acteur, args) {
 async function compteursClient(acteur, args) {
   exigerRole(acteur, ["UTILISATEUR"]);
   const debutMois = entier(args.debutMois, "début du mois", 0);
+  const limiteIntervention = Date.now() - (await chargerParametres()).passerelleDelaiInterventionMinutes * 6e4;
   const l = await base().ligne(
-    "SELECT COALESCE(SUM(CASE WHEN statut = 'EN_ATTENTE' THEN 1 ELSE 0 END), 0) AS en_attente, COALESCE(SUM(CASE WHEN statut = 'EN_COURS' THEN 1 ELSE 0 END), 0) AS en_cours, COALESCE(SUM(CASE WHEN statut = 'TRAITEE' THEN 1 ELSE 0 END), 0) AS traitees, COALESCE(SUM(CASE WHEN statut = 'TRAITEE' AND date_traitement >= ? THEN 1 ELSE 0 END), 0) AS nb_mois, COALESCE(SUM(CASE WHEN statut = 'TRAITEE' AND date_traitement >= ? THEN montant ELSE 0 END), 0) AS volume_mois, COALESCE(SUM(CASE WHEN statut = 'EN_COURS' AND etape_passerelle = 'BLOQUEE' THEN 1 ELSE 0 END), 0) AS bloquees FROM demandes_echange WHERE utilisateur_id = ?",
-    [debutMois, debutMois, acteur.id]
+    "SELECT COALESCE(SUM(CASE WHEN statut = 'EN_ATTENTE' THEN 1 ELSE 0 END), 0) AS en_attente, COALESCE(SUM(CASE WHEN statut = 'EN_COURS' THEN 1 ELSE 0 END), 0) AS en_cours, COALESCE(SUM(CASE WHEN statut = 'TRAITEE' THEN 1 ELSE 0 END), 0) AS traitees, COALESCE(SUM(CASE WHEN statut = 'TRAITEE' AND date_traitement >= ? THEN 1 ELSE 0 END), 0) AS nb_mois, COALESCE(SUM(CASE WHEN statut = 'TRAITEE' AND date_traitement >= ? THEN montant ELSE 0 END), 0) AS volume_mois, COALESCE(SUM(CASE WHEN statut = 'EN_COURS' AND etape_passerelle IN ('BLOQUEE', 'ATTENTE_ACCORD') AND COALESCE(date_blocage, 0) <= ? THEN 1 ELSE 0 END), 0) AS bloquees FROM demandes_echange WHERE utilisateur_id = ?",
+    [debutMois, debutMois, limiteIntervention, acteur.id]
   );
+  const jour = await situationClient(base(), acteur);
   return {
     enAttente: l ? l.en_attente : 0,
     enCours: l ? l.en_cours : 0,
     traitees: l ? l.traitees : 0,
     nbMois: l ? l.nb_mois : 0,
     volumeMois: l ? l.volume_mois : 0,
-    bloquees: l ? l.bloquees : 0
+    bloquees: l ? l.bloquees : 0,
+    // Limite d'envoi du compte : montant envoyé aujourd'hui et limite (0 : pas de limite).
+    envoyeJour: jour.envoyeJour,
+    limiteJour: jour.limiteJour
   };
 }
 async function numerosRecents(acteur, args) {
@@ -2895,6 +3766,9 @@ async function creerDemande(acteur, args) {
   const numeroDest = normaliserNumero(texte(s2.numeroDest, "numéro destinataire", 30));
   if (!numeroDest) throw new Erreur("Le numéro destinataire doit contenir 8 chiffres.");
   const p = await chargerParametres(b, true);
+  if (p.serviceSuspendu === 1) {
+    throw new ErreurHttp(400, "SERVICE_SUSPENDU", p.messageSuspension ? "Service d’échange momentanément suspendu : " + p.messageSuspension : "Le service d’échange est momentanément suspendu. Vos demandes déjà enregistrées continuent d’être traitées. Réessayez plus tard.");
+  }
   const brut = typeof s2.montant === "string" ? Number(s2.montant) : s2.montant;
   const montant = typeof brut === "number" && isFinite(brut) ? Math.round(brut) : NaN;
   if (!isFinite(montant) || montant <= 0) throw new Erreur("Saisissez le montant à envoyer.");
@@ -2921,27 +3795,38 @@ async function creerDemande(acteur, args) {
     throw new Erreur("Vous avez déjà " + enAttente + " demandes en attente : confirmez-les ou annulez-les avant d’en créer une nouvelle.");
   }
   const reference = await nouvelleReference(b);
-  return b.inserer(
-    "INSERT INTO demandes_echange (reference, utilisateur_id, wallet_source_id, wallet_dest_id, numero_source, numero_dest, montant, frais, frais_systeme, montant_net, libelle_frais, mode_source, mode_dest, statut, paiement_verifie, date_creation, nom_beneficiaire, commission, taux_commission) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'EN_ATTENTE', 0, ?, ?, 0, ?)",
-    [
-      reference,
-      acteur.id,
-      source.id,
-      dest.id,
-      numeroSource,
-      numeroDest,
-      montant,
-      c.frais,
-      c.fraisSysteme,
-      c.net,
-      c.libelle,
-      source.mode_echange,
-      dest.mode_echange,
-      Date.now(),
-      nomBeneficiaire,
-      c.tauxCommission
-    ]
-  );
+  try {
+    return await transaction(async (tx) => {
+      const t = Date.now();
+      const franchis = await controlerPlafonds(tx, acteur.id, numeroDest, c.net, t);
+      const id = await tx.inserer(
+        "INSERT INTO demandes_echange (reference, utilisateur_id, wallet_source_id, wallet_dest_id, numero_source, numero_dest, montant, frais, frais_systeme, montant_net, libelle_frais, mode_source, mode_dest, statut, paiement_verifie, date_creation, nom_beneficiaire, commission, taux_commission) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'EN_ATTENTE', 0, ?, ?, 0, ?)",
+        [
+          reference,
+          acteur.id,
+          source.id,
+          dest.id,
+          numeroSource,
+          numeroDest,
+          montant,
+          c.frais,
+          c.fraisSysteme,
+          c.net,
+          c.libelle,
+          source.mode_echange,
+          dest.mode_echange,
+          t,
+          nomBeneficiaire,
+          c.tauxCommission
+        ]
+      );
+      if (franchis.length) await alerterFranchissements(tx, acteur, id, franchis);
+      return id;
+    });
+  } catch (e) {
+    if (e instanceof DepassementPlafond) await signalerDepassement(acteur, e);
+    throw e;
+  }
 }
 async function demandeDuClientVerrouillee(tx, acteur, id) {
   const proprietaire = await tx.ligne("SELECT utilisateur_id FROM demandes_echange WHERE id = ? FOR UPDATE", [id]);
@@ -3022,6 +3907,20 @@ async function confirmerDemande(acteur, args) {
       );
       return { statut: "EN_COURS" };
     }
+    const depasse = await depassementEnvoi(tx, d);
+    if (depasse) {
+      await noterEnvoiArrete(tx, depasse);
+      await majDemande("UPDATE demandes_echange SET statut = 'EN_COURS', mode_source = ?, mode_dest = 'MANUEL', paiement_verifie = 1, ref_api_source = ?, date_confirmation = ? WHERE id = ? AND statut = 'EN_ATTENTE'", [modeSource, verif.ref, t, id]);
+      await tx.exec("UPDATE wallets SET solde_api = solde_api + ? WHERE id = ?", [d.montant, source.id]);
+      await notifierAdmins(
+        tx,
+        "LIMITE_ATTEINTE",
+        "Envoi automatique arrêté : " + d.reference,
+        "Rien n’est parti : " + texteDepassement(depasse, d.client_nom) + ". Vérifiez la demande ; si tout est en règle, relevez la limite (Limites d’envoi) puis envoyez, ou refusez la demande.",
+        id
+      );
+      return { statut: "EN_COURS" };
+    }
     const apiDest = await walletPourApi(tx, dest.id);
     const envoi = await envoyer(apiDest, d.numero_dest, d.montant_net, d.reference);
     if (!envoi.ok) {
@@ -3087,6 +3986,10 @@ async function confirmerParAdmin(acteur, args) {
     } else if (d.mode_dest === "MANUEL") {
       if (!capture) throw new Erreur("Ajoutez la capture de votre transaction : elle est obligatoire pour confirmer.");
     } else {
+      const depasse = await depassementEnvoi(tx, d);
+      if (depasse) {
+        throw new Erreur("Envoi automatique impossible : " + texteDepassement(depasse, d.client_nom) + ". Après vérification, relevez la limite (Limites d’envoi), puis confirmez à nouveau.");
+      }
       const apiDest = await walletPourApi(tx, dest.id);
       const envoi = await envoyer(apiDest, d.numero_dest, d.montant_net, d.reference);
       if (!envoi.ok) {
@@ -3221,12 +4124,123 @@ async function effacerDonneesEchanges(acteur) {
   });
 }
 
+// src/mouvements.ts
+var TYPES = ["RECHARGE", "REMBOURSEMENT", "RETRAIT", "CORRECTION"];
+var LIBELLES_MOUVEMENT = {
+  RECHARGE: "Recharge",
+  REMBOURSEMENT: "Remboursement",
+  RETRAIT: "Retrait",
+  CORRECTION: "Correction"
+};
+var ANCIENNETE_MAX_MINUTES = 48 * 60;
+async function declarerMouvement(acteur, args) {
+  exigerRole(acteur, ["ADMIN", "SUPER_ADMIN"]);
+  const walletId = entier(args.walletId, "wallet", 1);
+  const type = parmi(args.type, TYPES, "type de mouvement");
+  const montant = entier(args.montant, "montant", 1, 1e9);
+  const sens = type === "RECHARGE" ? "ENTREE" : type === "CORRECTION" ? parmi(args.sens, ["ENTREE", "SORTIE"], "sens") : "SORTIE";
+  const note = texte(args.note == null ? "" : args.note, "note", 200).replace(/\s+/g, " ").trim();
+  if (type === "CORRECTION" && note.length < 3) throw new Erreur("Expliquez la correction (par exemple : frais de l’opérateur).");
+  const ilYa = entier(args.ilYaMinutes == null ? 0 : args.ilYaMinutes, "heure du mouvement", 0, ANCIENNETE_MAX_MINUTES);
+  const ref = texte(args.operationId == null ? "" : args.operationId, "identifiant de la transaction", 40).replace(/\s+/g, "");
+  if (ref && !/^[A-Za-z0-9-]{4,30}$/.test(ref)) throw new Erreur("L’identifiant de la transaction est invalide.");
+  const reference = texte(args.reference == null ? "" : args.reference, "référence de la demande", 40).trim().toUpperCase();
+  if (type === "REMBOURSEMENT" && !reference) throw new Erreur("Indiquez la référence de la demande remboursée (par exemple DJX-261104-AB2CD).");
+  const t = Date.now();
+  const quand = t - ilYa * 6e4;
+  const id = await transaction(async (tx) => {
+    const w = await walletParId(tx, walletId, true);
+    if (!w) throw new Erreur("Wallet introuvable.");
+    const operateur = w.passerelle || null;
+    let demande = null;
+    if (type === "REMBOURSEMENT") {
+      demande = await tx.ligne("SELECT id, reference, utilisateur_id, montant, montant_rembourse, statut, numero_source, wallet_source_id, date_creation, date_confirmation FROM demandes_echange WHERE upper(reference) = ? FOR UPDATE", [reference]);
+      if (!demande) throw new Erreur("Aucune demande ne porte la référence " + reference + ".");
+      if (demande.statut !== "REFUSEE" && demande.statut !== "ANNULEE") {
+        throw new Erreur(demande.statut === "TRAITEE" ? "Cette demande a abouti : elle ne peut pas être remboursée." : "Refusez d’abord la demande (avec son motif), puis déclarez le remboursement.");
+      }
+      const reste = Number(demande.montant) - Number(demande.montant_rembourse || 0);
+      if (montant > reste) {
+        throw new Erreur(reste > 0 ? "Le remboursement dépasse le montant payé : " + fdj(reste) + " au plus." : "Cette demande est déjà entièrement remboursée.");
+      }
+    }
+    let operationRef = null;
+    if (operateur && ref) {
+      const sensOp = sens === "ENTREE" ? "RECU" : "ENVOYE";
+      const x = await tx.ligne(
+        "SELECT id, sens, montant, demande_id, role FROM operations_operateur WHERE operateur = ? AND operation_id = ? FOR UPDATE",
+        [operateur, ref]
+      );
+      if (x) {
+        if (x.role === "MOUVEMENT") throw new Erreur("Cette transaction a déjà été déclarée.");
+        if (x.demande_id != null) throw new Erreur("Cette transaction est le paiement ou l’envoi d’une demande : elle ne peut pas être un mouvement.");
+        if (x.sens && x.sens !== sensOp) throw new Erreur("Cette transaction est " + (x.sens === "RECU" ? "une réception" : "un envoi") + " : vérifiez le type de mouvement.");
+        if (x.montant != null && Number(x.montant) !== montant) throw new Erreur("Cette transaction est de " + fdj(Number(x.montant)) + ", pas de " + fdj(montant) + ".");
+        await tx.exec(
+          "UPDATE operations_operateur SET role = 'MOUVEMENT', utilisee = 1, sens = COALESCE(sens, ?), montant = COALESCE(montant, ?) WHERE id = ?",
+          [sensOp, montant, x.id]
+        );
+        operationRef = Number(x.id);
+      } else {
+        operationRef = await tx.inserer("INSERT INTO operations_operateur (operateur, operation_id, sens, montant, date_operation, source, role, utilisee, date_creation) VALUES (?, ?, ?, ?, ?, 'ADMIN', 'MOUVEMENT', 1, ?)", [operateur, ref, sensOp, montant, quand, t]);
+      }
+    }
+    if (demande) await enregistrerPaiementRembourse(tx, demande, t);
+    const nouvel = await tx.inserer(
+      "INSERT INTO mouvements_solde (wallet_id, operateur, type, sens, montant, demande_id, operation_ref, operation_id, note, date_mouvement, par, date_creation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      [w.id, operateur, type, sens, montant, demande ? demande.id : null, operationRef, ref || null, note || null, quand, acteur.id, t]
+    );
+    const libelle = LIBELLES_MOUVEMENT[type] + " de " + fdj(montant) + " sur " + w.nom;
+    const details = (demande ? " — demande " + demande.reference : "") + (ref ? " — ID " + ref : "") + (note ? " — " + note : "");
+    if (demande) {
+      await tx.exec("UPDATE demandes_echange SET montant_rembourse = montant_rembourse + ?, date_remboursement = ? WHERE id = ?", [montant, quand, demande.id]);
+      await notifier(
+        tx,
+        demande.utilisateur_id,
+        "REMBOURSEMENT",
+        "Remboursement effectué",
+        fdj(montant) + " vous ont été remboursés sur le " + formatNumero(demande.numero_source) + " (" + w.nom + ") pour la demande " + demande.reference + ".",
+        demande.id
+      );
+    }
+    await journaliser(tx, acteur.id, "MOUVEMENT_SOLDE", libelle + (sens === "ENTREE" ? " (entrée)" : " (sortie)") + details);
+    await notifierAdmins(tx, "SOLDE_MOUVEMENT", libelle, (sens === "ENTREE" ? "+" : "−") + fdj(montant) + " déclarés par " + acteur.nom_complet + details + (operateur ? ". Le solde est relu par le téléphone passerelle." : "."), demande ? demande.id : null, w.id);
+    if (operateur) await actualiserSoldes(tx, [operateur]);
+    return nouvel;
+  });
+  return { id };
+}
+async function enregistrerPaiementRembourse(tx, d, t) {
+  const source = await walletParId(tx, d.wallet_source_id);
+  const operateur = source && source.passerelle;
+  if (!operateur) return;
+  if (await tx.ligne("SELECT id FROM operations_operateur WHERE demande_id = ? AND role = 'PAIEMENT' LIMIT 1", [d.id])) return;
+  const libre = await tx.ligne(
+    "SELECT id FROM operations_operateur WHERE operateur = ? AND sens = 'RECU' AND demande_id IS NULL AND utilisee = 0 AND montant = ? AND numero = ? AND date_creation > ? ORDER BY id DESC LIMIT 1 FOR UPDATE",
+    [operateur, d.montant, d.numero_source, t - 24 * 3600 * 1e3]
+  );
+  if (libre) {
+    await tx.exec("UPDATE operations_operateur SET demande_id = ?, role = 'PAIEMENT', utilisee = 1 WHERE id = ?", [d.id, libre.id]);
+    return;
+  }
+  await tx.exec(
+    "INSERT INTO operations_operateur (operateur, operation_id, sens, montant, numero, date_operation, source, demande_id, role, utilisee, date_creation) VALUES (?, ?, 'RECU', ?, ?, ?, 'ADMIN', ?, 'PAIEMENT', 1, ?) ON CONFLICT (operateur, operation_id) DO NOTHING",
+    [operateur, "REMB-" + d.reference, d.montant, d.numero_source, d.date_confirmation || d.date_creation, d.id, t]
+  );
+}
+async function listerMouvements(acteur, args) {
+  exigerRole(acteur, ["ADMIN", "SUPER_ADMIN"]);
+  const walletId = entierOuNull(args.walletId, "wallet", 1);
+  const limite = entier(args.limite == null ? 50 : args.limite, "limite", 1, 200);
+  return base().lignes("SELECT m.id, m.wallet_id, w.nom AS wallet_nom, m.type, m.sens, m.montant, m.operation_id, m.note, m.date_mouvement, m.date_creation, d.reference AS reference, a.nom_complet AS par_nom, o.source AS source_operation FROM mouvements_solde m JOIN wallets w ON w.id = m.wallet_id LEFT JOIN demandes_echange d ON d.id = m.demande_id LEFT JOIN utilisateurs a ON a.id = m.par LEFT JOIN operations_operateur o ON o.id = m.operation_ref " + (walletId != null ? "WHERE m.wallet_id = ? " : "") + "ORDER BY m.id DESC LIMIT " + limite, walletId != null ? [walletId] : []);
+}
+
 // src/rapports.ts
-var JOUR = 24 * 3600 * 1e3;
+var JOUR2 = 24 * 3600 * 1e3;
 function periode(args, nomDebut, nomFin) {
   const debut = entier(args[nomDebut], "début de période", 0);
   const fin = entier(args[nomFin], "fin de période", 0);
-  if (fin <= debut || fin - debut > 400 * JOUR) throw new Erreur("Période invalide.");
+  if (fin <= debut || fin - debut > 400 * JOUR2) throw new Erreur("Période invalide.");
   return { debut, fin };
 }
 async function lignesTraitees(debut, fin) {
@@ -3434,19 +4448,18 @@ var OPERATIONS = {
   // --- serveur
   "serveur.info": { acces: "public", executer: async () => ({ version: VERSION, modeTest: config.modeTest, email: emailConfigure() }) },
   // --- authentification
-  "auth.connexion": { acces: "public", limite: "connexion", executer: (args) => seConnecter(args) },
-  "auth.connexionEmpreinte": { acces: "public", limite: "connexion", executer: (args) => seConnecterParEmpreinte(args) },
+  "auth.defi": { acces: "public", limite: "connexion", executer: async () => creerDefi() },
+  "auth.connexion": { acces: "public", limite: "connexion", executer: (args, ctx) => seConnecter(args, ctx) },
+  "auth.connexionEmpreinte": { acces: "public", limite: "connexion", executer: (args, ctx) => seConnecterParEmpreinte(args, ctx) },
+  "auth.confirmerAppareil": { acces: "public", limite: "code", executer: (args, ctx) => confirmerAppareil(args, ctx) },
   "auth.inscrire": { acces: "public", limite: "inscription", executer: (args) => inscrire(args) },
   "auth.confirmerEmail": { acces: "public", limite: "code", executer: (args) => confirmerEmail(args) },
   "auth.renvoyerCode": { acces: "public", limite: "envoi", executer: (args) => renvoyerCode(args) },
   "auth.delaiRenvoi": { acces: "public", executer: (args) => delaiRenvoi(args) },
   "auth.demanderReinitialisation": { acces: "public", limite: "envoi", executer: (args) => demanderReinitialisation(args) },
   "auth.reinitialiser": { acces: "public", limite: "code", executer: (args) => reinitialiserMotDePasse(args) },
-  "auth.session": {
-    acces: "connecte",
-    restreint: true,
-    executer: async (args, ctx) => ({ utilisateur: a(ctx), seSouvenir: s(ctx).seSouvenir, doitChangerMdp: s(ctx).doitChanger })
-  },
+  "auth.session": { acces: "connecte", restreint: true, executer: (args, ctx) => infoSession(a(ctx), s(ctx)) },
+  "auth.reglerDeconnexion": { acces: "admin", executer: (args, ctx) => reglerDeconnexion(a(ctx), args) },
   "auth.deconnexion": { acces: "connecte", restreint: true, executer: (args, ctx) => seDeconnecter(s(ctx)) },
   "auth.motDePasseObligatoire": {
     acces: "connecte",
@@ -3460,6 +4473,17 @@ var OPERATIONS = {
   "empreinte.activer": { acces: "connecte", limite: "connexion", executer: (args, ctx) => activerEmpreinte(a(ctx), args) },
   "empreinte.etat": { acces: "connecte", executer: (args, ctx) => etatEmpreinteServeur(a(ctx), args) },
   "empreinte.desactiver": { acces: "connecte", executer: (args, ctx) => desactiverEmpreinte(a(ctx), args) },
+  // --- téléphones des partenaires (super admin)
+  "plafonds.lister": { acces: "admin", executer: (args, ctx) => listerPlafonds(a(ctx)) },
+  "plafonds.definir": { acces: "admin", executer: (args, ctx) => definirPlafond(a(ctx), args) },
+  "plafonds.retirer": { acces: "admin", executer: (args, ctx) => retirerPlafond(a(ctx), args) },
+  "service.suspendre": { acces: "super", executer: (args, ctx) => suspendreService(a(ctx), args) },
+  "mouvements.declarer": { acces: "admin", executer: (args, ctx) => declarerMouvement(a(ctx), args) },
+  "mouvements.lister": { acces: "admin", executer: (args, ctx) => listerMouvements(a(ctx), args) },
+  "appareils.lister": { acces: "super", executer: (args, ctx) => listerAppareils(a(ctx)) },
+  "appareils.enAttente": { acces: "super", executer: (args, ctx) => nombreAppareilsEnAttente(a(ctx)) },
+  "appareils.approuver": { acces: "super", executer: (args, ctx) => approuverAppareil(a(ctx), args) },
+  "appareils.retirer": { acces: "super", executer: (args, ctx) => retirerAppareil(a(ctx), s(ctx), args) },
   // --- comptes (super admin)
   "comptes.lister": { acces: "super", executer: (args, ctx) => listerComptes(a(ctx), args) },
   "comptes.creerAdmin": { acces: "super", executer: async (args, ctx) => ({ id: await creerAdmin(a(ctx), args) }) },
@@ -3523,12 +4547,13 @@ var OPERATIONS = {
   "outils.genererDemo": { acces: "super", executer: async (args, ctx) => ({ total: await genererDonneesDemo(a(ctx)) }) },
   "outils.effacer": { acces: "super", executer: (args, ctx) => effacerDonneesEchanges(a(ctx)) }
 };
-function autorise(acces, u) {
+function autorise(acces, u, session) {
   if (u.statut !== "ACTIF") return false;
+  const partenaire = session.application === "partenaire" && session.appareilId != null;
   if (acces === "connecte") return true;
-  if (acces === "utilisateur") return u.role === "UTILISATEUR";
-  if (acces === "admin") return u.role === "ADMIN" || u.role === "SUPER_ADMIN";
-  if (acces === "super") return u.role === "SUPER_ADMIN";
+  if (acces === "utilisateur") return u.role === "UTILISATEUR" && session.application === "client";
+  if (acces === "admin") return (u.role === "ADMIN" || u.role === "SUPER_ADMIN") && partenaire;
+  if (acces === "super") return u.role === "SUPER_ADMIN" && partenaire;
   return false;
 }
 async function executerOperation(nom, args, ctx) {
@@ -3542,7 +4567,7 @@ async function executerOperation(nom, args, ctx) {
     if (ctx.session.doitChanger && !op.restreint) {
       throw new ErreurHttp(403, "MDP_A_CHANGER", "Choisissez d’abord votre nouveau mot de passe.");
     }
-    if (!autorise(op.acces, ctx.acteur)) throw new ErreurHttp(403, "DROITS", MSG_DROITS);
+    if (!autorise(op.acces, ctx.acteur, ctx.session)) throw new ErreurHttp(403, "DROITS", MSG_DROITS);
   }
   const resultat = await op.executer(args, ctx);
   return resultat === void 0 ? null : resultat;
@@ -3597,6 +4622,15 @@ function jetonDe(req) {
   const m = /^Bearer\s+([0-9a-f]{64})$/i.exec(h.trim());
   return m ? m[1].toLowerCase() : null;
 }
+function applicationDe(req) {
+  const v = String(req.headers["x-app"] || "").trim().toLowerCase();
+  return v === "partenaire" ? "partenaire" : "client";
+}
+function inactiviteDe(req) {
+  const v = String(req.headers["x-inactivite"] || "").trim();
+  if (!/^\d{1,10}$/.test(v)) return null;
+  return Number(v);
+}
 function jetonPasserelleDe(req) {
   const h = req.headers.authorization || "";
   const m = /^Passerelle\s+([0-9a-f]{64})$/i.exec(h.trim());
@@ -3637,13 +4671,13 @@ async function api(req, res, nom) {
       throw new ErreurHttp(400, "JSON", "Requête illisible.");
     }
     if (!args || typeof args !== "object" || Array.isArray(args)) throw new ErreurHttp(400, "JSON", "Requête illisible.");
-    const ctx = { acteur: null, session: null, refusSession: null, ip, passerelle: null };
+    const ctx = { acteur: null, session: null, refusSession: null, ip, passerelle: null, application: applicationDe(req), inactivite: inactiviteDe(req) };
     const jeton = jetonDe(req);
     const jetonPasserelle = jetonPasserelleDe(req);
     if (jetonPasserelle) {
       ctx.passerelle = await passerelleParJeton(jetonPasserelle);
     } else if (jeton) {
-      const s2 = await lireSession(jeton);
+      const s2 = await lireSession(jeton, { application: ctx.application, inactivite: ctx.inactivite });
       if ("refus" in s2) {
         ctx.refusSession = s2.refus;
       } else {
